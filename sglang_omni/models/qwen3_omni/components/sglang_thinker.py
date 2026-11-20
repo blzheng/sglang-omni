@@ -40,6 +40,7 @@ from transformers import PretrainedConfig
 from sglang_omni.models.qwen3_omni.components.thinker_fused_rope import (
     install_thinker_fused_rope,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.sampler_compile import (
     SamplerCompileForms,
@@ -262,8 +263,12 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
             aux_hidden_states=aux_hidden_states,
         )
 
+    if not current_platform.is_cpu():
+        def precompile_kernels_after_loading(self) -> None:
+            return self._precompile_kernels_after_loading()
+
     @torch.no_grad()
-    def precompile_kernels_after_loading(self) -> None:
+    def _precompile_kernels_after_loading(self) -> None:
         """Load FlashInfer's sampling module when it draws the unseeded requests, and run
         one MoE layer on zero rows once per fused MoE kernel variant that a forward up to
         the prefill ceiling reaches, so no request waits for either."""

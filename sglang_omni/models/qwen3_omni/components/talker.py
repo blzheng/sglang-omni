@@ -334,7 +334,7 @@ class Qwen3OmniMoeTalkerSparseMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
         hidden_states = hidden_states.view(-1, hidden_dim)
         linear_hidden_states = hidden_states
         linear_dtype = self.shared_expert_gate.weight.dtype
-        if linear_hidden_states.dtype != linear_dtype:
+        if linear_hidden_states.dtype != linear_dtype and not current_platform.is_cpu():
             linear_hidden_states = linear_hidden_states.to(dtype=linear_dtype)
         else:
             pass

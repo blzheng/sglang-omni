@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.pool_host.common import (  # noqa: leading-underscore 
     _cuda_host_unregister,
     alloc_with_host_register,
 )
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,19 @@ class StagedPromptHidden:
 
     slot_ids: torch.Tensor
     hidden_states: torch.Tensor
-    copy_done: torch.cuda.Event
+    copy_done: torch.cuda.Event | CPUCopyDone
+
+
+@dataclass(kw_only=True)
+class CPUCopyDone:
+    def record(self) -> None:
+        pass
+
+    def query(self) -> bool:
+        return True
+
+    def synchronize(self) -> None:
+        pass
 
 
 class PromptHiddenStore:
@@ -65,7 +78,7 @@ class PromptHiddenStore:
             (slot_count, hidden_size),
             dtype=dtype,
             device="cpu",
-            pin_memory=True,
+            pin_memory=is_pin_memory_available(device),
             allocator=HostTensorAllocator(),
         )
         self.is_host_registered = allocate is alloc_with_host_register
@@ -80,11 +93,21 @@ class PromptHiddenStore:
     def stage(self, slot_ids: torch.Tensor, hidden_states: torch.Tensor) -> None:
         """Copy a forward's rows and their slot ids to host behind the forward on its stream."""
         staged = StagedPromptHidden(
-            slot_ids=torch.empty(slot_ids.shape, dtype=slot_ids.dtype, pin_memory=True),
-            hidden_states=torch.empty(
-                hidden_states.shape, dtype=hidden_states.dtype, pin_memory=True
+            slot_ids=torch.empty(
+                slot_ids.shape,
+                dtype=slot_ids.dtype,
+                pin_memory=is_pin_memory_available(slot_ids.device),
             ),
-            copy_done=self.device_module.Event(),
+            hidden_states=torch.empty(
+                hidden_states.shape,
+                dtype=hidden_states.dtype,
+                pin_memory=is_pin_memory_available(hidden_states.device),
+            ),
+            copy_done=(
+                self.device_module.Event()
+                if is_pin_memory_available(hidden_states.device)
+                else CPUCopyDone()
+            ),
         )
         staged.slot_ids.copy_(slot_ids, non_blocking=True)
         staged.hidden_states.copy_(hidden_states, non_blocking=True)

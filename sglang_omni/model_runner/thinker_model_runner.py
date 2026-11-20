@@ -15,6 +15,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.utils.common import is_pin_memory_available
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -611,9 +612,10 @@ class ThinkerModelRunner(ModelRunner):
     def async_host_buf(self, like: torch.Tensor, n: int) -> torch.Tensor:
         # note (jiaxin deng): two pinned buffers ping-ponged so resolve(N) reads
         # one while launch(N+1) writes the other.
+        pin_memory = is_pin_memory_available(like.device)
         if self.th_host_bufs is None or self.th_host_bufs[0].shape[0] < n:
             self.th_host_bufs = [
-                torch.empty(n, dtype=like.dtype, device="cpu", pin_memory=True)
+                torch.empty(n, dtype=like.dtype, device="cpu", pin_memory=pin_memory)
                 for _ in range(2)
             ]
             self.th_slot = 0

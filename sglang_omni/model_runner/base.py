@@ -284,8 +284,15 @@ class ModelRunner(Generic[RequestDataInput]):
         else:
             pass
         if need_alloc:
+            device = getattr(self, "device", torch.device("cpu"))
+            pin_memory = is_pin_memory_available(device)
             bufs = [
-                torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+                torch.empty(
+                    shape,
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=pin_memory,
+                )
                 for _ in range(2)
             ]
             setattr(self, bufs_attr, bufs)
