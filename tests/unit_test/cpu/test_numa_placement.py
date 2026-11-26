@@ -1,17 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU worker processes must be spread across NUMA nodes.
-
-Accelerators place a stage by device index. CPU cannot — torch rejects any
-``cpu:N`` — so placement is the thread and memory binding SGLang derives from
-``SGLANG_CPU_OMP_THREADS_BIND``. Without it every single-rank stage takes
-SGLang's ``cpu_ids_by_node[tp_rank]`` default with ``tp_rank == 0``, so every
-process binds to node 0 while each sizes its memory pool as if it owned a whole
-node. That is the shape that OOM-killed Qwen3-Omni with ~1.4 TB free.
-
-The binding unit is the **process**: the mask is exported before
-``proc.start()`` and covers every thread and allocation in it. Stages sharing a
-process therefore share a node, which several models rely on.
-"""
+"""CPU worker processes are spread across NUMA nodes; the binding unit is the process."""
 
 from __future__ import annotations
 
@@ -38,12 +26,14 @@ def fresh_assignment():
 def nodes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """A fixed four-node topology, so tests do not depend on the host."""
     topology = ["0-9", "10-19", "20-29", "30-39"]
-    monkeypatch.setattr(cpu_numa, "cpu_ids_by_node", lambda: list(topology))
+    monkeypatch.setattr(cpu_numa, "get_cpu_ids_by_node", lambda: list(topology))
     return topology
 
 
 def _stage(name: str, tp_size: int = 1):
-    return SimpleNamespace(stage_name=name, tp_size=tp_size, gpu_id=0)
+    return SimpleNamespace(
+        stage_name=name, tp_size=tp_size, gpu_id=0, allow_child_processes=False
+    )
 
 
 def _bind(platform, process_name, stage_names, env, tp_size: int = 1):
@@ -117,12 +107,11 @@ def test_a_user_map_places_the_named_stage(nodes) -> None:
     assert mask == nodes[2]
 
 
-def test_a_user_map_entry_wraps_like_the_automatic_one(nodes) -> None:
+def test_a_user_map_entry_beyond_the_node_count_is_rejected(nodes) -> None:
     platform = CPUOmniPlatform()
 
-    mask = _bind(platform, "p", ["talker"], env={_MAP: f"talker={len(nodes)}"})[_BIND]
-
-    assert mask == nodes[0]
+    with pytest.raises(ValueError, match="NUMA node"):
+        _bind(platform, "p", ["talker"], env={_MAP: f"talker={len(nodes)}"})
 
 
 def test_unnamed_processes_still_spread_around_a_user_entry(nodes) -> None:
@@ -149,7 +138,9 @@ def test_splitting_one_process_across_nodes_is_refused(nodes) -> None:
 def test_agreeing_entries_in_one_process_are_fine(nodes) -> None:
     platform = CPUOmniPlatform()
 
-    mask = _bind(platform, "pipeline", ["pre", "vocoder"], env={_MAP: "pre=2,vocoder=2"})
+    mask = _bind(
+        platform, "pipeline", ["pre", "vocoder"], env={_MAP: "pre=2,vocoder=2"}
+    )
 
     assert mask[_BIND] == nodes[2]
 
@@ -193,7 +184,7 @@ def test_an_unreadable_topology_degrades_to_the_previous_behaviour(
     """Failing to read sysfs must not break startup — it leaves SGLang on the
     node-0 default that predates this hook.
     """
-    monkeypatch.setattr(cpu_numa, "cpu_ids_by_node", lambda: [])
+    monkeypatch.setattr(cpu_numa, "get_cpu_ids_by_node", lambda: [])
 
     assert CPUOmniPlatform().get_process_placement_env("p", [_stage("s")], env={}) == {}
 
@@ -219,6 +210,9 @@ def test_every_process_asks_the_platform_not_just_tp_ones(
     asked: list[tuple[str, list[str]]] = []
 
     class _Platform:
+        def is_cpu(self):
+            return True
+
         def get_stage_process_env(self, spec, env=None):
             raise AssertionError("the per-stage hook is for TP stages only")
 
@@ -233,7 +227,7 @@ def test_every_process_asks_the_platform_not_just_tp_ones(
         stage_specs=[_stage("pre"), _stage("vocoder")],
     )
 
-    assert stage_workers._get_worker_process_env(spec) == {"MARKER": "pipeline"}
+    assert stage_workers.get_worker_process_env(spec) == {"MARKER": "pipeline"}
     assert asked == [("pipeline", ["pre", "vocoder"])]
 
 
@@ -249,6 +243,7 @@ def test_a_tp_stage_still_must_own_its_process(
         stage_workers,
         "current_platform",
         SimpleNamespace(
+            is_cpu=lambda: True,
             get_stage_process_env=lambda spec, env=None: {},
             get_process_placement_env=lambda p, s, env=None: {},
         ),
@@ -260,7 +255,7 @@ def test_a_tp_stage_still_must_own_its_process(
     )
 
     with pytest.raises(AssertionError, match="must own their OS process"):
-        stage_workers._get_worker_process_env(spec)
+        stage_workers.get_worker_process_env(spec)
 
 
 def test_accelerators_are_unaffected() -> None:
@@ -271,3 +266,132 @@ def test_accelerators_are_unaffected() -> None:
     for cls in (CUDAOmniPlatform, XPUOmniPlatform):
         platform = cls.__new__(cls)
         assert platform.get_process_placement_env("p", [_stage("s")], env={}) == {}
+
+
+def test_bound_core_count_reads_the_first_rank_range() -> None:
+    assert cpu_numa.bound_core_count({_BIND: "0-9"}) == 10
+    assert cpu_numa.bound_core_count({_BIND: "0-3,8|16-31"}) == 5
+    assert cpu_numa.bound_core_count({}) is None
+    assert cpu_numa.bound_core_count({_BIND: "all"}) is None
+
+
+def _spawn_spec(env_defaults, written_env=frozenset(), cpu_threads=None):
+    from sglang_omni.pipeline.stage_workers import StageWorkerProcessSpec
+
+    stage = SimpleNamespace(
+        stage_name="pre",
+        tp_size=1,
+        gpu_id=0,
+        allow_child_processes=False,
+        env_defaults=env_defaults,
+        written_env=written_env,
+    )
+    return StageWorkerProcessSpec(
+        process_name="p", stage_specs=[stage], cpu_threads=cpu_threads
+    )
+
+
+def _spawned_omp_threads(monkeypatch, spec) -> str:
+    import os
+
+    from sglang_omni.pipeline import stage_workers
+
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.setattr(stage_workers, "current_platform", CPUOmniPlatform())
+    monkeypatch.setattr(stage_workers, "get_platform_spec", lambda _p: "cpu")
+    monkeypatch.setenv(_BIND, "0-9")
+    with stage_workers.patched_spawn_env(spec):
+        return os.environ["OMP_NUM_THREADS"]
+
+
+def test_host_sized_omp_default_is_capped_to_the_bound_node(monkeypatch) -> None:
+    spec = _spawn_spec({"OMP_NUM_THREADS": "192"})
+
+    assert _spawned_omp_threads(monkeypatch, spec) == "10"
+
+
+def test_written_omp_value_beats_the_node_cap(monkeypatch) -> None:
+    spec = _spawn_spec(
+        {"OMP_NUM_THREADS": "192"}, written_env=frozenset({"OMP_NUM_THREADS"})
+    )
+
+    assert _spawned_omp_threads(monkeypatch, spec) == "192"
+
+
+def test_cpu_plan_fallback_is_capped_to_the_bound_node(monkeypatch) -> None:
+    spec = _spawn_spec({}, cpu_threads=48)
+
+    assert _spawned_omp_threads(monkeypatch, spec) == "10"
+
+
+def test_bind_list_covers_every_gpu_id_so_sglang_can_index_it(nodes) -> None:
+    """SGLang indexes the list by gpu_id; a one-entry list fails its assertion."""
+    platform = CPUOmniPlatform()
+    stage = SimpleNamespace(stage_name="s", tp_size=1, gpu_id=2)
+
+    mask = platform.get_process_placement_env("p", [stage], env={})[_BIND]
+
+    assert mask.split("|") == [nodes[0]] * 3
+
+
+def test_binding_hook_widens_the_mask_to_the_bound_range(monkeypatch) -> None:
+    import os
+
+    applied: list[set[int]] = []
+    calls: list[str] = []
+    monkeypatch.setattr(
+        os, "sched_setaffinity", lambda _pid, cpus: applied.append(cpus)
+    )
+    monkeypatch.setattr(
+        cpu_numa.sglang_bootstrap,
+        "_init_cpu_threads_env",
+        lambda **kwargs: calls.append("pinned"),
+    )
+    monkeypatch.setattr(
+        cpu_numa.sglang_bootstrap, cpu_numa.WIDEN_HOOK_MARKER, False, raising=False
+    )
+
+    assert cpu_numa.install_binding_hook()
+    assert not cpu_numa.install_binding_hook()
+    cpu_numa.sglang_bootstrap._init_cpu_threads_env(
+        local_omp_cpuid="0-3", dist_init_method=None
+    )
+
+    assert calls == ["pinned"]
+    assert applied == [{0, 1, 2, 3}]
+
+
+def test_non_cpu_platforms_never_reach_the_cpu_hooks(monkeypatch) -> None:
+    import os
+
+    from sglang_omni.pipeline import stage_workers
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("CPU-only hook called on an accelerator")
+
+    monkeypatch.setattr(
+        stage_workers,
+        "current_platform",
+        SimpleNamespace(
+            is_cpu=lambda: False,
+            get_stage_process_env=lambda spec, env=None: {"STAGE": "1"},
+            get_process_placement_env=_forbidden,
+            get_process_thread_cap=_forbidden,
+            prepare_worker_process=_forbidden,
+        ),
+    )
+    monkeypatch.setattr(stage_workers, "get_platform_spec", lambda _p: "gpu")
+
+    plain = SimpleNamespace(
+        process_name="p", stage_specs=[_stage("a")], cpu_threads=None
+    )
+    tp = SimpleNamespace(
+        process_name="p", stage_specs=[_stage("a", tp_size=2)], cpu_threads=None
+    )
+    assert stage_workers.get_worker_process_env(plain) == {}
+    assert stage_workers.get_worker_process_env(tp) == {"STAGE": "1"}
+
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    spec = _spawn_spec({"OMP_NUM_THREADS": "192"})
+    with stage_workers.patched_spawn_env(spec):
+        assert os.environ["OMP_NUM_THREADS"] == "192"

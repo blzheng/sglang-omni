@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     resolved_view,
 )
 from sglang.srt.configs.model_config import ModelConfig
-from collections.abc import Mapping
-from typing import TYPE_CHECKING
-
 from sglang.srt.platforms.cpu import CpuDeviceMixin
 from sglang.srt.server_args import ServerArgs
 
@@ -44,23 +44,11 @@ class CPUOmniPlatform(CpuDeviceMixin, OmniPlatform):
             pass
         return effective_quantization
 
-    def supports_generation_cuda_graph(self) -> bool:
-        return False
-
     def prepare_worker_process(self) -> None:
-        """Arm the widen-on-bind hook before SGLang can narrow the mask."""
         cpu_numa.install_binding_hook()
 
-    def set_device(self, device) -> None:
-        """CPU has no device to select; used as the post-binding hook.
-
-        This runs in the stage worker once SGLang has already called
-        ``init_cpu_threads_env``, which is the only point where the single-core
-        mask it leaves behind can be undone. Idempotent — see
-        ``cpu_numa.widen_main_thread_to_its_node``.
-        """
-        super().set_device(device)
-        cpu_numa.widen_main_thread_to_its_node()
+    def get_process_thread_cap(self, env: Mapping[str, str]) -> int | None:
+        return cpu_numa.bound_core_count(env)
 
     def get_process_placement_env(
         self,
@@ -68,16 +56,12 @@ class CPUOmniPlatform(CpuDeviceMixin, OmniPlatform):
         stage_specs: list[StageLaunchConfig],
         env: Mapping[str, str] | None = None,
     ) -> dict[str, str]:
-        """Bind this worker process to one NUMA node.
-
-        See :mod:`sglang_omni.platforms.cpu_numa` for why the unit is the
-        process and what happens when stages disagree about the node.
-        """
         if not stage_specs:
             return {}
         return cpu_numa.threads_bind_env(
             process_name=process_name,
             stage_names=[spec.stage_name for spec in stage_specs],
             tp_size=max(spec.tp_size for spec in stage_specs),
+            gpu_ids=[spec.gpu_id for spec in stage_specs],
             env=env,
         )

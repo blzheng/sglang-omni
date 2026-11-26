@@ -148,25 +148,15 @@ class OmniPlatform(DeviceMixin):
         stage_specs: list[StageLaunchConfig],
         env: Mapping[str, str] | None = None,
     ) -> dict[str, str]:
-        """Return env that places a whole worker process, not one stage.
-
-        Separate from :meth:`get_stage_process_env` because the unit differs: an
-        accelerator places each stage by device index and needs nothing here,
-        while CPU can only place the process as a whole (its NUMA binding covers
-        every thread and allocation in it) and so must see all of its stages.
-        """
+        """Return env that places a whole worker process, for platforms that cannot place a stage by device index."""
         return {}
 
-    def cross_attention_backend(self) -> str | None:
-        """Attention backend for encoder-decoder cross attention, if required."""
+    def get_process_thread_cap(self, env: Mapping[str, str]) -> int | None:
+        """Upper bound for a derived OMP_NUM_THREADS given the worker's start env, or None for no bound."""
         return None
 
     def prepare_worker_process(self) -> None:
-        """Run once in a freshly spawned stage worker, before anything else.
-
-        The place for setup that must happen ahead of model construction.
-        Nothing to do on an accelerator.
-        """
+        """Run once in a freshly spawned stage worker, before model construction."""
 
     def get_intra_node_transport(self) -> TransportKind:
         """Get TransportKind between devices on the same node"""

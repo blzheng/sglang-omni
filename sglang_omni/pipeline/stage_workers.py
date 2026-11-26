@@ -212,13 +212,7 @@ def get_worker_process_env(spec: StageWorkerProcessSpec) -> dict[str, str]:
     is a placement bug. A stage that owns native child processes also owns its
     process, which the platform may narrow to that stage's GPUs.
 
-    Two hooks contribute, because the placement unit differs by platform. The
-    per-stage hook is unchanged and still only consulted for TP stages, which is
-    all an accelerator needs — it places each stage by device index. The
-    process-level hook is asked for every process, because CPU has no device
-    index to place with (torch rejects any ``cpu:N``) and can only bind the
-    process as a whole; it defaults to ``{}`` everywhere else, so accelerator
-    behaviour is unchanged.
+    On CPU the platform also places the whole process, since CPU has no device index to place a stage with.
     """
     native = [s for s in spec.stage_specs if s.allow_child_processes]
     if native and len(spec.stage_specs) > 1:
@@ -231,16 +225,27 @@ def get_worker_process_env(spec: StageWorkerProcessSpec) -> dict[str, str]:
     else:
         pass
     tp_stages = [s for s in spec.stage_specs if s.tp_size > 1]
+    # CPU is the only platform that places a whole process; accelerators keep
+    # the per-stage path below untouched.
+    if not tp_stages and not current_platform.is_cpu():
+        return {}
+    else:
+        pass
     if tp_stages and (len(tp_stages) > 1 or len(spec.stage_specs) > 1):
         raise AssertionError(
             f"Process {spec.process_name!r} mixes a TP stage with other "
             "stages; TP stages must own their OS process exclusively. "
             f"stage_specs={[s.stage_name for s in spec.stage_specs]}"
         )
-
+    else:
+        pass
     stage_env = (
         current_platform.get_stage_process_env(tp_stages[0]) if tp_stages else {}
     )
+    if not current_platform.is_cpu():
+        return stage_env
+    else:
+        pass
     placement_env = current_platform.get_process_placement_env(
         spec.process_name, list(spec.stage_specs)
     )
@@ -320,6 +325,25 @@ def patched_spawn_env(
             **worker_process_env,
         }
     )
+    thread_cap = (
+        current_platform.get_process_thread_cap(
+            {**os.environ, **env_default_updates, **worker_process_env}
+        )
+        if current_platform.is_cpu()
+        else None
+    )
+    if (
+        thread_cap is not None
+        and default_threads.isdigit()
+        and int(default_threads) > thread_cap
+        and not any(
+            "OMP_NUM_THREADS" in stage_spec.written_env
+            for stage_spec in spec.stage_specs
+        )
+    ):
+        # The platform binds this process to fewer cores than a default sized
+        # for the host; written values still win.
+        env_default_updates["OMP_NUM_THREADS"] = str(thread_cap)
     updates = {
         **env_default_updates,
         **compat_env_defaults,
@@ -332,7 +356,11 @@ def patched_spawn_env(
         and "OMP_NUM_THREADS" not in os.environ
         and "OMP_NUM_THREADS" not in updates
     ):
-        updates["OMP_NUM_THREADS"] = str(spec.cpu_threads)
+        updates["OMP_NUM_THREADS"] = str(
+            spec.cpu_threads
+            if thread_cap is None
+            else max(1, min(spec.cpu_threads, thread_cap))
+        )
         updates["SGLANG_OMNI_OMP_FROM_CPU_PLAN"] = "1"
         omp_source = "cpu_plan_fallback"
     else:
@@ -723,7 +751,10 @@ def stage_process_main(
     log = logging.getLogger(f"stage_workers.{spec.process_name}")
 
     try:
-        current_platform.prepare_worker_process()
+        if current_platform.is_cpu():
+            current_platform.prepare_worker_process()
+        else:
+            pass
         for stage_spec in spec.stage_specs:
             prepare_accelerator_environment(stage_spec, log)
         apply_gpu_compat_env_defaults()
