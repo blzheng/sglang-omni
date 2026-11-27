@@ -249,6 +249,7 @@ def bound_cpus(
 def apply_bound_affinity(gpu_ids: Iterable[int | None] = ()) -> None:
     """Move the worker onto its bound CPUs before anything creates threads, for workers that never start SGLang's own pinning."""
     cpus = bound_cpus(os.environ, gpu_ids)
+    # Pop even without a bind so the variable never leaks to child processes.
     launcher_cpus = os.environ.pop(LAUNCHER_CPUS_ENV, "")
     if cpus is None:
         return
@@ -265,9 +266,13 @@ def apply_bound_affinity(gpu_ids: Iterable[int | None] = ()) -> None:
             os.sched_setaffinity(0, spawned_cpus)
         return
     target_cpus = cpus & allowed_cpus
+    if not target_cpus:
+        logger.warning(
+            "The bound CPUs are outside the launcher's allowed CPUs; keeping the spawned mask."
+        )
+        os.sched_setaffinity(0, spawned_cpus)
+        return
     try:
-        if not target_cpus:
-            raise OSError("the bound CPUs are outside the launcher's allowed CPUs")
         os.sched_setaffinity(0, target_cpus)
     except OSError as exc:
         logger.warning("Could not apply the bound CPU range (%s).", exc)
