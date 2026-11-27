@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Protocol
 
@@ -151,7 +151,9 @@ class OmniPlatform(DeviceMixin):
         """Return env that places a whole worker process, for platforms that cannot place a stage by device index."""
         return {}
 
-    def get_process_thread_cap(self, env: Mapping[str, str]) -> int | None:
+    def get_process_thread_cap(
+        self, env: Mapping[str, str], gpu_ids: Iterable[int | None] = ()
+    ) -> int | None:
         """Upper bound for a derived OMP_NUM_THREADS given the worker's start env, or None for no bound."""
         return None
 
@@ -159,7 +161,7 @@ class OmniPlatform(DeviceMixin):
         """Threads one worker process can use, replacing the host-wide equal share, or None to keep the share."""
         return None
 
-    def prepare_worker_process(self) -> None:
+    def prepare_worker_process(self, gpu_ids: Iterable[int | None] = ()) -> None:
         """Run once in a freshly spawned stage worker, before model construction."""
 
     def get_intra_node_transport(self) -> TransportKind:

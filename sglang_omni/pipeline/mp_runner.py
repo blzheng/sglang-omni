@@ -336,8 +336,10 @@ def apply_cpu_thread_plan(groups: list[StageGroup]) -> dict[str, int]:
 
     cpu_budget = effective_cpu_count()
     process_count = len(process_specs)
-    threads_per_process = current_platform.get_process_thread_budget() or max(
-        1, cpu_budget // process_count
+    host_share = max(1, cpu_budget // process_count)
+    platform_budget = current_platform.get_process_thread_budget()
+    threads_per_process = (
+        host_share if platform_budget is None else min(platform_budget, host_share)
     )
     plan = {}
     # note (Richard Wang): CPU-only processes stay near the GPUs the pipeline

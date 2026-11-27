@@ -209,29 +209,50 @@ def threads_bind_env(
     return {THREADS_BIND_ENV: "|".join([cpu_ids_per_node[node]] * entry_count)}
 
 
-def apply_bound_affinity() -> None:
-    """Move the worker onto its bound node before anything creates threads, for workers that never start SGLang's own pinning."""
-    raw = os.environ.get(THREADS_BIND_ENV, "").strip()
-    if not raw or raw == "all":
-        return
-    try:
-        os.sched_setaffinity(0, parse_cpu_list(raw.split("|", 1)[0]))
-    except (OSError, ValueError) as exc:
-        logger.warning("Could not apply the bound CPU range %r (%s).", raw, exc)
-
-
-def bound_core_count(env: Mapping[str, str]) -> int | None:
-    """Cores in the first range of SGLANG_CPU_OMP_THREADS_BIND, if set.
-
-    SGLang resizes the OMP pool to this range and ignores OMP_NUM_THREADS, so it is the real thread ceiling.
-    """
+def bound_cpus(
+    env: Mapping[str, str], gpu_ids: Iterable[int | None] = ()
+) -> set[int] | None:
+    """CPUs SGLang binds a worker to: the bind entries its gpu ids select, or the first entry without gpu ids."""
     raw = env.get(THREADS_BIND_ENV, "").strip()
     if not raw or raw == "all":
         return None
+    entries = raw.split("|")
+    indices = {gpu_id or 0 for gpu_id in gpu_ids} or {0}
     try:
-        return len(parse_cpu_list(raw.split("|", 1)[0])) or None
+        cpus = set().union(
+            *(
+                parse_cpu_list(entries[index])
+                for index in indices
+                if index < len(entries)
+            )
+        )
     except ValueError:
         return None
+    return cpus or None
+
+
+def apply_bound_affinity(gpu_ids: Iterable[int | None] = ()) -> None:
+    """Move the worker onto its bound CPUs before anything creates threads, for workers that never start SGLang's own pinning."""
+    cpus = bound_cpus(os.environ, gpu_ids)
+    if cpus is None:
+        return
+    try:
+        # SGLang caches the topology intersected with the current affinity, so read it before narrowing.
+        get_cpu_ids_by_node()
+        os.sched_setaffinity(0, cpus)
+    except Exception as exc:
+        logger.warning("Could not apply the bound CPU range (%s).", exc)
+
+
+def bound_core_count(
+    env: Mapping[str, str], gpu_ids: Iterable[int | None] = ()
+) -> int | None:
+    """Cores a worker is bound to by SGLANG_CPU_OMP_THREADS_BIND, if set.
+
+    SGLang resizes the OMP pool to this range and ignores OMP_NUM_THREADS, so it is the real thread ceiling.
+    """
+    cpus = bound_cpus(env, gpu_ids)
+    return len(cpus) if cpus else None
 
 
 def node_core_count() -> int | None:

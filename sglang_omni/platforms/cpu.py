@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.model_override_base import (
@@ -44,15 +44,17 @@ class CPUOmniPlatform(CpuDeviceMixin, OmniPlatform):
             pass
         return effective_quantization
 
-    def prepare_worker_process(self) -> None:
-        cpu_numa.apply_bound_affinity()
+    def prepare_worker_process(self, gpu_ids: Iterable[int | None] = ()) -> None:
+        cpu_numa.apply_bound_affinity(gpu_ids)
         cpu_numa.install_binding_hook()
 
     def get_process_thread_budget(self) -> int | None:
         return cpu_numa.node_core_count()
 
-    def get_process_thread_cap(self, env: Mapping[str, str]) -> int | None:
-        return cpu_numa.bound_core_count(env)
+    def get_process_thread_cap(
+        self, env: Mapping[str, str], gpu_ids: Iterable[int | None] = ()
+    ) -> int | None:
+        return cpu_numa.bound_core_count(env, gpu_ids)
 
     def get_process_placement_env(
         self,

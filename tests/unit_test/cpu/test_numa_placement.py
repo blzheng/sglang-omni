@@ -399,6 +399,16 @@ def test_a_bind_list_configured_on_the_stage_is_not_overwritten(
     assert stage_workers.get_worker_process_env(spec, {_BIND: "0-3"}) == {}
 
 
+def test_a_stage_owning_child_processes_is_still_placed(monkeypatch, nodes) -> None:
+    from sglang_omni.pipeline import stage_workers
+
+    monkeypatch.setattr(stage_workers, "current_platform", CPUOmniPlatform())
+    spec = _spawn_spec({})
+    spec.stage_specs[0].allow_child_processes = True
+
+    assert stage_workers.get_worker_process_env(spec) == {_BIND: nodes[0]}
+
+
 def test_a_worker_without_sglang_is_still_moved_onto_its_node(monkeypatch) -> None:
     import os
 
@@ -409,8 +419,37 @@ def test_a_worker_without_sglang_is_still_moved_onto_its_node(monkeypatch) -> No
     monkeypatch.setenv(_BIND, "4-6|10-12")
 
     cpu_numa.apply_bound_affinity()
+    cpu_numa.apply_bound_affinity([1])
 
-    assert applied == [{4, 5, 6}]
+    assert applied == [{4, 5, 6}, {10, 11, 12}]
+
+
+def test_affinity_is_left_alone_when_the_topology_cannot_be_cached(
+    monkeypatch,
+) -> None:
+    import os
+
+    def unreadable():
+        raise RuntimeError("no lscpu")
+
+    applied: list[set[int]] = []
+    monkeypatch.setattr(cpu_numa, "get_cpu_ids_by_node", unreadable)
+    monkeypatch.setattr(
+        os, "sched_setaffinity", lambda _pid, cpus: applied.append(cpus)
+    )
+    monkeypatch.setenv(_BIND, "0-3")
+
+    cpu_numa.apply_bound_affinity()
+
+    assert applied == []
+
+
+def test_a_workers_gpu_id_selects_its_bind_entry() -> None:
+    env = {_BIND: "0-3|4-35"}
+
+    assert cpu_numa.bound_core_count(env, [1]) == 32
+    assert cpu_numa.bound_core_count(env, [0, 1]) == 36
+    assert cpu_numa.bound_core_count(env, [5]) is None
 
 
 def test_bind_list_covers_every_gpu_id_so_sglang_can_index_it(nodes) -> None:
@@ -516,3 +555,25 @@ def test_cpu_thread_plan_uses_the_node_budget_not_the_host_share(
     mp_runner.apply_cpu_thread_plan([SimpleNamespace(process_specs=specs)])
 
     assert {spec.cpu_threads for spec in specs} == {32}
+
+
+def test_thread_plan_node_budget_respects_the_cpu_quota(monkeypatch) -> None:
+    from sglang_omni.pipeline import mp_runner
+    from sglang_omni.pipeline.stage_workers import (
+        StageLaunchConfig,
+        StageWorkerProcessSpec,
+    )
+
+    monkeypatch.setattr(mp_runner, "effective_cpu_count", lambda: 28)
+    monkeypatch.setattr(
+        mp_runner,
+        "current_platform",
+        SimpleNamespace(get_process_thread_budget=lambda: 64),
+    )
+    specs = [
+        StageWorkerProcessSpec(f"p{i}", [StageLaunchConfig(f"s{i}")]) for i in range(7)
+    ]
+
+    mp_runner.apply_cpu_thread_plan([SimpleNamespace(process_specs=specs)])
+
+    assert {spec.cpu_threads for spec in specs} == {4}

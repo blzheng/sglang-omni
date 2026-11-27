@@ -222,8 +222,16 @@ def get_worker_process_env(
             "A stage that owns native child processes must own its OS process"
         )
     elif native:
-        env = current_platform.get_stage_process_env(native[0])
-        return {**env, NATIVE_GPUS_NARROWED_ENV: "true"} if env else {}
+        stage_env = current_platform.get_stage_process_env(native[0])
+        placement_env = (
+            current_platform.get_process_placement_env(
+                spec.process_name, list(spec.stage_specs), env=env
+            )
+            if current_platform.is_cpu()
+            else {}
+        )
+        narrowed = {NATIVE_GPUS_NARROWED_ENV: "true"} if stage_env else {}
+        return {**stage_env, **narrowed, **placement_env}
     else:
         pass
     tp_stages = [s for s in spec.stage_specs if s.tp_size > 1]
@@ -331,7 +339,8 @@ def patched_spawn_env(
     )
     thread_cap = (
         current_platform.get_process_thread_cap(
-            {**os.environ, **env_default_updates, **worker_process_env}
+            {**os.environ, **env_default_updates, **worker_process_env},
+            stage_gpu_ids(spec.stage_specs),
         )
         if current_platform.is_cpu()
         else None
@@ -757,7 +766,7 @@ def stage_process_main(
 
     try:
         if current_platform.is_cpu():
-            current_platform.prepare_worker_process()
+            current_platform.prepare_worker_process(stage_gpu_ids(spec.stage_specs))
         else:
             pass
         for stage_spec in spec.stage_specs:
