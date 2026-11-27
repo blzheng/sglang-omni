@@ -271,7 +271,12 @@ def install_binding_hook() -> bool:
     init_cpu_threads_env pins the main thread to a single core, and every thread created afterwards inherits that mask. OMP workers keep their own per-core affinity, so widening the main thread to the bound range does not disturb them.
     """
     original = getattr(sglang_bootstrap, "_init_cpu_threads_env", None)
-    if original is None or getattr(sglang_bootstrap, WIDEN_HOOK_MARKER, False):
+    if original is None:
+        logger.warning(
+            "SGLang has no _init_cpu_threads_env to hook; the main thread stays pinned to one core after thread binding."
+        )
+        return False
+    if getattr(sglang_bootstrap, WIDEN_HOOK_MARKER, False):
         return False
 
     def widen_after_binding(

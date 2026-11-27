@@ -151,6 +151,9 @@ class OmniPlatform(DeviceMixin):
         """Return env that places a whole worker process, for platforms that cannot place a stage by device index."""
         return {}
 
+    def reset_process_placement(self) -> None:
+        """Forget placements recorded for earlier worker processes, before a pipeline plans its own."""
+
     def get_process_thread_cap(
         self, env: Mapping[str, str], gpu_ids: Iterable[int | None] = ()
     ) -> int | None:

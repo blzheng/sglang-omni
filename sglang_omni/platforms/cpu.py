@@ -48,6 +48,9 @@ class CPUOmniPlatform(CpuDeviceMixin, OmniPlatform):
         cpu_numa.apply_bound_affinity(gpu_ids)
         cpu_numa.install_binding_hook()
 
+    def reset_process_placement(self) -> None:
+        cpu_numa.reset_assignment()
+
     def get_process_thread_budget(self) -> int | None:
         return cpu_numa.node_core_count()
 

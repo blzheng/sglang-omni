@@ -546,7 +546,10 @@ def test_cpu_thread_plan_uses_the_node_budget_not_the_host_share(
     monkeypatch.setattr(
         mp_runner,
         "current_platform",
-        SimpleNamespace(get_process_thread_budget=lambda: 32),
+        SimpleNamespace(
+            get_process_thread_budget=lambda: 32,
+            reset_process_placement=lambda: None,
+        ),
     )
     specs = [
         StageWorkerProcessSpec(f"p{i}", [StageLaunchConfig(f"s{i}")]) for i in range(7)
@@ -555,6 +558,15 @@ def test_cpu_thread_plan_uses_the_node_budget_not_the_host_share(
     mp_runner.apply_cpu_thread_plan([SimpleNamespace(process_specs=specs)])
 
     assert {spec.cpu_threads for spec in specs} == {32}
+
+
+def test_planning_a_pipeline_forgets_earlier_placements(nodes) -> None:
+    platform = CPUOmniPlatform()
+    assert _bind(platform, "old", ["old"], {})[_BIND] == nodes[0]
+
+    platform.reset_process_placement()
+
+    assert _bind(platform, "new", ["new"], {})[_BIND] == nodes[0]
 
 
 def test_thread_plan_node_budget_respects_the_cpu_quota(monkeypatch) -> None:
@@ -568,7 +580,10 @@ def test_thread_plan_node_budget_respects_the_cpu_quota(monkeypatch) -> None:
     monkeypatch.setattr(
         mp_runner,
         "current_platform",
-        SimpleNamespace(get_process_thread_budget=lambda: 64),
+        SimpleNamespace(
+            get_process_thread_budget=lambda: 64,
+            reset_process_placement=lambda: None,
+        ),
     )
     specs = [
         StageWorkerProcessSpec(f"p{i}", [StageLaunchConfig(f"s{i}")]) for i in range(7)
