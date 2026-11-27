@@ -26,7 +26,7 @@ def fresh_assignment():
 def nodes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """A fixed four-node topology, so tests do not depend on the host."""
     topology = ["0-9", "10-19", "20-29", "30-39"]
-    monkeypatch.setattr(cpu_numa, "get_cpu_ids_by_node", lambda: list(topology))
+    monkeypatch.setattr(cpu_numa, "numa_nodes", lambda: dict(enumerate(topology)))
     return topology
 
 
@@ -240,7 +240,7 @@ def test_an_unreadable_topology_degrades_to_the_previous_behaviour(
     """Failing to read sysfs must not break startup — it leaves SGLang on the
     node-0 default that predates this hook.
     """
-    monkeypatch.setattr(cpu_numa, "get_cpu_ids_by_node", lambda: [])
+    monkeypatch.setattr(cpu_numa, "numa_nodes", lambda: {})
 
     assert CPUOmniPlatform().get_process_placement_env("p", [_stage("s")], env={}) == {}
 
@@ -324,11 +324,11 @@ def test_accelerators_are_unaffected() -> None:
         assert platform.get_process_placement_env("p", [_stage("s")], env={}) == {}
 
 
-def test_bound_core_count_reads_the_first_rank_range() -> None:
-    assert cpu_numa.bound_core_count({_BIND: "0-9"}) == 10
-    assert cpu_numa.bound_core_count({_BIND: "0-3,8|16-31"}) == 5
-    assert cpu_numa.bound_core_count({}) is None
-    assert cpu_numa.bound_core_count({_BIND: "all"}) is None
+def test_bound_cpus_reads_the_first_rank_range() -> None:
+    assert cpu_numa.bound_cpus({_BIND: "0-9"}) == set(range(10))
+    assert len(cpu_numa.bound_cpus({_BIND: "0-3,8|16-31"})) == 5
+    assert cpu_numa.bound_cpus({}) is None
+    assert cpu_numa.bound_cpus({_BIND: "all"}) is None
 
 
 def _spawn_spec(env_defaults, written_env=frozenset(), cpu_threads=None):
@@ -409,6 +409,42 @@ def test_a_stage_owning_child_processes_is_still_placed(monkeypatch, nodes) -> N
     assert stage_workers.get_worker_process_env(spec) == {_BIND: nodes[0]}
 
 
+def test_map_entries_are_lscpu_node_ids_not_list_offsets(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cpu_numa, "numa_nodes", lambda: {0: "0-9", 2: "20-29", 5: "50-59"}
+    )
+    platform = CPUOmniPlatform()
+
+    assert _bind(platform, "p", ["talker"], {_MAP: "talker=5"})[_BIND] == "50-59"
+    with pytest.raises(ValueError, match="NUMA node"):
+        _bind(platform, "q", ["thinker"], {_MAP: "thinker=1"})
+
+
+def test_an_explicit_bind_list_counts_against_auto_placement(nodes) -> None:
+    platform = CPUOmniPlatform()
+
+    assert _bind(platform, "pinned", ["a"], {_BIND: "0-9"}) == {}
+
+    assert _bind(platform, "auto", ["b"], {})[_BIND] == nodes[1]
+
+
+def test_the_spawning_thread_runs_on_the_bound_node(monkeypatch) -> None:
+    import os
+
+    from sglang_omni.pipeline import stage_workers
+
+    calls: list[set[int]] = []
+    monkeypatch.setattr(stage_workers, "current_platform", CPUOmniPlatform())
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(40)))
+    monkeypatch.setattr(os, "sched_setaffinity", lambda _pid, cpus: calls.append(cpus))
+    monkeypatch.setenv(_BIND, "4-6")
+
+    with stage_workers.spawn_affinity(_spawn_spec({})):
+        pass
+
+    assert calls == [{4, 5, 6}, set(range(40))]
+
+
 def test_a_worker_without_sglang_is_still_moved_onto_its_node(monkeypatch) -> None:
     import os
 
@@ -447,9 +483,9 @@ def test_affinity_is_left_alone_when_the_topology_cannot_be_cached(
 def test_a_workers_gpu_id_selects_its_bind_entry() -> None:
     env = {_BIND: "0-3|4-35"}
 
-    assert cpu_numa.bound_core_count(env, [1]) == 32
-    assert cpu_numa.bound_core_count(env, [0, 1]) == 36
-    assert cpu_numa.bound_core_count(env, [5]) is None
+    assert len(cpu_numa.bound_cpus(env, [1])) == 32
+    assert len(cpu_numa.bound_cpus(env, [0, 1])) == 36
+    assert cpu_numa.bound_cpus(env, [5]) is None
 
 
 def test_bind_list_covers_every_gpu_id_so_sglang_can_index_it(nodes) -> None:
@@ -504,7 +540,7 @@ def test_non_cpu_platforms_never_reach_the_cpu_hooks(monkeypatch) -> None:
             is_cpu=lambda: False,
             get_stage_process_env=lambda spec, env=None: {"STAGE": "1"},
             get_process_placement_env=_forbidden,
-            get_process_thread_cap=_forbidden,
+            get_process_cpu_mask=_forbidden,
             prepare_worker_process=_forbidden,
         ),
     )
@@ -526,9 +562,7 @@ def test_non_cpu_platforms_never_reach_the_cpu_hooks(monkeypatch) -> None:
 
 
 def test_node_core_count_is_the_smallest_node(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        cpu_numa, "get_cpu_ids_by_node", lambda: ["0-31,128-159", "32-47"]
-    )
+    monkeypatch.setattr(cpu_numa, "numa_nodes", lambda: {0: "0-31,128-159", 1: "32-47"})
 
     assert cpu_numa.node_core_count() == 16
 

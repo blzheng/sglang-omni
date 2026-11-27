@@ -270,15 +270,26 @@ def spawn_affinity(spec: StageWorkerProcessSpec) -> Generator[None, None, None]:
     that thread's mask, so every thread the child creates, including pools
     started while it imports its stages, stays on the planned CPUs.
     """
-    launcher_cpus = None if spec.cpu_affinity is None else os.sched_getaffinity(0)
-    if launcher_cpus is not None:
-        os.sched_setaffinity(0, spec.cpu_affinity)
+    launcher_cpus = os.sched_getaffinity(0)
+    planned_cpus = spec.cpu_affinity
+    if current_platform.is_cpu():
+        bound_cpus = current_platform.get_process_cpu_mask(
+            os.environ, stage_gpu_ids(spec.stage_specs)
+        )
+        if bound_cpus and bound_cpus & launcher_cpus:
+            planned_cpus = bound_cpus & launcher_cpus
+        else:
+            pass
+    else:
+        pass
+    if planned_cpus is not None:
+        os.sched_setaffinity(0, planned_cpus)
     else:
         pass
     try:
         yield
     finally:
-        if launcher_cpus is not None:
+        if planned_cpus is not None:
             os.sched_setaffinity(0, launcher_cpus)
         else:
             pass
@@ -337,14 +348,15 @@ def patched_spawn_env(
             **worker_process_env,
         }
     )
-    thread_cap = (
-        current_platform.get_process_thread_cap(
+    bound_cpus = (
+        current_platform.get_process_cpu_mask(
             {**os.environ, **env_default_updates, **worker_process_env},
             stage_gpu_ids(spec.stage_specs),
         )
         if current_platform.is_cpu()
         else None
     )
+    thread_cap = len(bound_cpus) if bound_cpus else None
     planned_threads = env_default_updates.get("OMP_NUM_THREADS", "")
     if (
         thread_cap is not None

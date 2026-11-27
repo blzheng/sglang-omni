@@ -13,6 +13,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 
 import sglang.srt.distributed.bootstrap as sglang_bootstrap
+from sglang.srt.utils.device import get_physical_cpus_by_numa_or_block
 from sglang.srt.utils.numa_utils import get_cpu_ids_by_node
 
 from sglang_omni.utils.cpu import parse_cpu_list
@@ -60,6 +61,15 @@ def parse_numa_map(raw: str | None) -> dict[str, tuple[int, ...]]:
     return mapping
 
 
+def numa_nodes() -> dict[int, str]:
+    """CPU lists of the NUMA nodes that have CPUs, keyed by the node id lscpu reports, which need not be contiguous."""
+    return {
+        node: ",".join(map(str, sorted(cpus)))
+        for node, cpus in sorted(get_physical_cpus_by_numa_or_block().items())
+        if cpus
+    }
+
+
 def reset_assignment() -> None:
     """Forget recorded placements, for tests and for a changed topology or map."""
     with node_assignment_lock:
@@ -74,15 +84,13 @@ def assign_node(
     tp_size: int,
     tp_rank: int,
     user_map: Mapping[str, tuple[int, ...]],
-    cpu_ids_per_node: list[str],
+    topology: Mapping[int, str],
 ) -> int:
     """Pick and record the node of one process; the caller holds node_assignment_lock."""
-    node_count = len(cpu_ids_per_node)
+    node_ids = sorted(topology)
     group = ",".join(stage_names)
     reserved = {node for nodes in user_map.values() for node in nodes}
-    free_nodes = [n for n in range(node_count) if n not in reserved] or list(
-        range(node_count)
-    )
+    free_nodes = [n for n in node_ids if n not in reserved] or node_ids
     by_load = sorted(free_nodes, key=lambda n: (node_usage[n], n))
     requested: dict[str, int] = {}
     for name in stage_names:
@@ -110,10 +118,10 @@ def assign_node(
         node = planned[tp_rank]
     else:
         for name, requested_node in requested.items():
-            if requested_node >= node_count:
+            if requested_node not in topology:
                 raise ValueError(
                     f"{NUMA_MAP_ENV} asks for node {requested_node} for stage {name!r}, but "
-                    f"this host has only {node_count} NUMA node(s)."
+                    f"this host has NUMA node(s) {node_ids} with CPUs."
                 )
         if len(set(requested.values())) > 1:
             raise NumaPlacementConflict(
@@ -137,6 +145,21 @@ def assign_node(
     return node
 
 
+def claim_explicit_nodes(
+    process_name: str,
+    env: Mapping[str, str],
+    gpu_ids: Iterable[int | None],
+    topology: Mapping[int, str],
+) -> None:
+    """Count the nodes a user-set bind list covers, so auto placement does not stack other workers on them."""
+    claimed = bound_cpus(env, gpu_ids) or set()
+    covered = [node for node, ids in topology.items() if parse_cpu_list(ids) & claimed]
+    with node_assignment_lock:
+        if covered and process_name not in node_by_process_name:
+            node_usage.update(covered)
+            node_by_process_name[process_name] = covered[0]
+
+
 def threads_bind_env(
     *,
     process_name: str,
@@ -151,10 +174,8 @@ def threads_bind_env(
     SGLang indexes the bind list by gpu_id, so the list repeats the node once per index up to the largest gpu_id. Each tp rank is its own process and gets its own node, since every rank carries gpu_id 0 on CPU.
     """
     source_env = env if env is not None else os.environ
-    if source_env.get(THREADS_BIND_ENV):
-        return {}
     try:
-        cpu_ids_per_node = get_cpu_ids_by_node()
+        topology = numa_nodes()
     except Exception as exc:
         logger.warning(
             "Could not read the NUMA topology (%s); leaving %s unset.",
@@ -162,7 +183,10 @@ def threads_bind_env(
             THREADS_BIND_ENV,
         )
         return {}
-    if not cpu_ids_per_node:
+    if not topology:
+        return {}
+    if source_env.get(THREADS_BIND_ENV):
+        claim_explicit_nodes(process_name, source_env, gpu_ids, topology)
         return {}
 
     user_map = parse_numa_map(source_env.get(NUMA_MAP_ENV))
@@ -175,19 +199,19 @@ def threads_bind_env(
                 tp_size,
                 tp_rank,
                 user_map,
-                cpu_ids_per_node,
+                topology,
             )
     logger.info(
-        "Binding CPU process %s (stages: %s) to NUMA node %d of %d.",
+        "Binding CPU process %s (stages: %s) to NUMA node %d (of %d with CPUs).",
         process_name,
         ", ".join(stage_names) or "<none>",
         node,
-        len(cpu_ids_per_node),
+        len(topology),
     )
     entry_count = (
         max((gpu_id for gpu_id in gpu_ids if gpu_id is not None), default=0) + 1
     )
-    return {THREADS_BIND_ENV: "|".join([cpu_ids_per_node[node]] * entry_count)}
+    return {THREADS_BIND_ENV: "|".join([topology[node]] * entry_count)}
 
 
 def bound_cpus(
@@ -225,22 +249,10 @@ def apply_bound_affinity(gpu_ids: Iterable[int | None] = ()) -> None:
         logger.warning("Could not apply the bound CPU range (%s).", exc)
 
 
-def bound_core_count(
-    env: Mapping[str, str], gpu_ids: Iterable[int | None] = ()
-) -> int | None:
-    """Cores a worker is bound to by SGLANG_CPU_OMP_THREADS_BIND, if set.
-
-    SGLang resizes the OMP pool to this range and ignores OMP_NUM_THREADS, so it is the real thread ceiling.
-    """
-    cpus = bound_cpus(env, gpu_ids)
-    return len(cpus) if cpus else None
-
-
 def node_core_count() -> int | None:
     """Cores of the smallest NUMA node, the most one bound process or one tp rank runs OMP threads on."""
     try:
-        cpu_ids_per_node = get_cpu_ids_by_node()
-        return min(len(parse_cpu_list(ids)) for ids in cpu_ids_per_node) or None
+        return min(len(parse_cpu_list(ids)) for ids in numa_nodes().values()) or None
     except Exception as exc:
         logger.warning("Could not read the NUMA topology (%s).", exc)
         return None
@@ -266,13 +278,13 @@ def install_binding_hook() -> bool:
         original(local_omp_cpuid=local_omp_cpuid, **kwargs)
         if not local_omp_cpuid:
             return
-        bound_cpus = (
+        cpus = (
             parse_cpu_list(local_omp_cpuid)
             if isinstance(local_omp_cpuid, str)
             else set(local_omp_cpuid)
         )
         try:
-            os.sched_setaffinity(0, bound_cpus)
+            os.sched_setaffinity(0, cpus)
         except OSError as exc:
             logger.warning("Could not widen the CPU mask to the bound range (%s).", exc)
 

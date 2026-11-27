@@ -54,10 +54,10 @@ class CPUOmniPlatform(CpuDeviceMixin, OmniPlatform):
     def get_process_thread_budget(self) -> int | None:
         return cpu_numa.node_core_count()
 
-    def get_process_thread_cap(
+    def get_process_cpu_mask(
         self, env: Mapping[str, str], gpu_ids: Iterable[int | None] = ()
-    ) -> int | None:
-        return cpu_numa.bound_core_count(env, gpu_ids)
+    ) -> set[int] | None:
+        return cpu_numa.bound_cpus(env, gpu_ids)
 
     def get_process_placement_env(
         self,

@@ -154,10 +154,10 @@ class OmniPlatform(DeviceMixin):
     def reset_process_placement(self) -> None:
         """Forget placements recorded for earlier worker processes, before a pipeline plans its own."""
 
-    def get_process_thread_cap(
+    def get_process_cpu_mask(
         self, env: Mapping[str, str], gpu_ids: Iterable[int | None] = ()
-    ) -> int | None:
-        """Upper bound for a derived OMP_NUM_THREADS given the worker's start env, or None for no bound."""
+    ) -> set[int] | None:
+        """CPUs the worker's start env binds it to, which also bound its OMP thread count, or None for no binding."""
         return None
 
     def get_process_thread_budget(self) -> int | None:
