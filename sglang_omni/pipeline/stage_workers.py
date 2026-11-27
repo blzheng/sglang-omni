@@ -204,6 +204,17 @@ class StageWorkerProcessSpec:
     failure_event: Event | None = field(default=None, repr=False, compare=False)
 
 
+def get_process_placement_env(
+    spec: StageWorkerProcessSpec, env: Mapping[str, str] | None
+) -> dict[str, str]:
+    """Env placing the whole process, which only CPU does."""
+    if not current_platform.is_cpu():
+        return {}
+    return current_platform.get_process_placement_env(
+        spec.process_name, list(spec.stage_specs), env=env
+    )
+
+
 def get_worker_process_env(
     spec: StageWorkerProcessSpec, env: Mapping[str, str] | None = None
 ) -> dict[str, str]:
@@ -224,15 +235,8 @@ def get_worker_process_env(
         )
     elif native:
         stage_env = current_platform.get_stage_process_env(native[0])
-        placement_env = (
-            current_platform.get_process_placement_env(
-                spec.process_name, list(spec.stage_specs), env=env
-            )
-            if current_platform.is_cpu()
-            else {}
-        )
         narrowed = {NATIVE_GPUS_NARROWED_ENV: "true"} if stage_env else {}
-        return {**stage_env, **narrowed, **placement_env}
+        return {**stage_env, **narrowed, **get_process_placement_env(spec, env)}
     else:
         pass
     tp_stages = [s for s in spec.stage_specs if s.tp_size > 1]
@@ -253,14 +257,7 @@ def get_worker_process_env(
     stage_env = (
         current_platform.get_stage_process_env(tp_stages[0]) if tp_stages else {}
     )
-    if not current_platform.is_cpu():
-        return stage_env
-    else:
-        pass
-    placement_env = current_platform.get_process_placement_env(
-        spec.process_name, list(spec.stage_specs), env=env
-    )
-    return {**stage_env, **placement_env}
+    return {**stage_env, **get_process_placement_env(spec, env)}
 
 
 @contextmanager
@@ -282,9 +279,16 @@ def spawn_affinity(spec: StageWorkerProcessSpec) -> Generator[None, None, None]:
         )
     else:
         pass
-    launcher_cpus = os.sched_getaffinity(0) if planned_cpus else None
-    target_cpus = None if launcher_cpus is None else launcher_cpus & set(planned_cpus)
+    if not planned_cpus:
+        yield
+        return
+    launcher_cpus = os.sched_getaffinity(0)
+    target_cpus = launcher_cpus & set(planned_cpus) if on_cpu else set(planned_cpus)
     if not target_cpus:
+        logger.warning(
+            "Process %s plans CPUs outside the launcher's allowed CPUs; starting it unbound.",
+            spec.process_name,
+        )
         yield
         return
     previous_launcher_env = os.environ.get(LAUNCHER_CPUS_ENV)
@@ -298,10 +302,12 @@ def spawn_affinity(spec: StageWorkerProcessSpec) -> Generator[None, None, None]:
         yield
     finally:
         os.sched_setaffinity(0, launcher_cpus)
-        if previous_launcher_env is None:
+        if on_cpu and previous_launcher_env is None:
             os.environ.pop(LAUNCHER_CPUS_ENV, None)
-        else:
+        elif on_cpu:
             os.environ[LAUNCHER_CPUS_ENV] = previous_launcher_env
+        else:
+            pass
 
 
 @contextmanager
