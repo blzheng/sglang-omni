@@ -687,6 +687,36 @@ def test_planning_reserves_nodes_a_later_worker_pins_explicitly(
     assert _bind(platform, "auto", ["a"], {})[_BIND] == nodes[1]
 
 
+def test_planning_gives_tp_groups_nodes_before_single_process_stages(
+    monkeypatch, nodes
+) -> None:
+    from sglang_omni.pipeline.stage_workers import StageWorkerProcessSpec
+
+    monkeypatch.delenv(_BIND, raising=False)
+    platform = CPUOmniPlatform()
+
+    def process(name: str, tp_size: int = 1, tp_rank: int = 0):
+        stage = _stage(name.split("_")[0], tp_size, tp_rank)
+        stage.env_defaults = {}
+        return StageWorkerProcessSpec(process_name=name, stage_specs=[stage])
+
+    singles = [process(name) for name in ("pre", "img", "audio")]
+    ranks = [process(f"thinker_tp{r}", tp_size=2, tp_rank=r) for r in range(2)]
+    platform.plan_process_placement(singles + ranks)
+
+    single_masks = [
+        _bind(platform, spec.process_name, [spec.stage_specs[0].stage_name], {})[_BIND]
+        for spec in singles
+    ]
+    rank_masks = [
+        _bind(platform, f"thinker_tp{r}", ["thinker"], {}, tp_size=2, tp_rank=r)[_BIND]
+        for r in range(2)
+    ]
+
+    assert rank_masks == nodes[:2]
+    assert single_masks == [nodes[2], nodes[3], nodes[0]]
+
+
 def test_thread_plan_node_budget_respects_the_cpu_quota(monkeypatch) -> None:
     from sglang_omni.pipeline import mp_runner
     from sglang_omni.pipeline.stage_workers import (

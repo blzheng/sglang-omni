@@ -56,15 +56,24 @@ class CPUOmniPlatform(CpuDeviceMixin, OmniPlatform):
         self, process_specs: list[StageWorkerProcessSpec]
     ) -> None:
         cpu_numa.reset_assignment()
+        spec_envs = []
         for spec in process_specs:
             env = {}
             for stage_spec in spec.stage_specs:
                 env.update(stage_spec.env_defaults)
+            env = {**env, **os.environ}
+            spec_envs.append((spec, env))
             cpu_numa.claim_explicit_nodes(
                 spec.process_name,
-                {**env, **os.environ},
+                env,
                 [stage_spec.gpu_id for stage_spec in spec.stage_specs],
             )
+        # Tensor-parallel groups need several nodes at once, so they pick before single-process stages take the free ones, whatever the start order.
+        for spec, env in spec_envs:
+            if any(stage_spec.tp_size > 1 for stage_spec in spec.stage_specs):
+                self.get_process_placement_env(
+                    spec.process_name, spec.stage_specs, env=env
+                )
 
     def get_process_thread_budget(self) -> int | None:
         return cpu_numa.node_core_count()
