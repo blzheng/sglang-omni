@@ -240,12 +240,6 @@ def get_worker_process_env(
     else:
         pass
     tp_stages = [s for s in spec.stage_specs if s.tp_size > 1]
-    # CPU is the only platform that places a whole process; accelerators keep
-    # the per-stage path below untouched.
-    if not tp_stages and not current_platform.is_cpu():
-        return {}
-    else:
-        pass
     if tp_stages and (len(tp_stages) > 1 or len(spec.stage_specs) > 1):
         raise AssertionError(
             f"Process {spec.process_name!r} mixes a TP stage with other "
