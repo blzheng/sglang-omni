@@ -449,9 +449,12 @@ def test_a_worker_without_sglang_is_still_moved_onto_its_node(monkeypatch) -> No
     import os
 
     applied: list[set[int]] = []
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(40)))
     monkeypatch.setattr(
         os, "sched_setaffinity", lambda _pid, cpus: applied.append(set(cpus))
     )
+    monkeypatch.setattr(cpu_numa, "get_cpu_ids_by_node", lambda: [])
+    monkeypatch.delenv(cpu_numa.LAUNCHER_CPUS_ENV, raising=False)
     monkeypatch.setenv(_BIND, "4-6|10-12")
 
     cpu_numa.apply_bound_affinity()
@@ -470,9 +473,11 @@ def test_affinity_is_left_alone_when_the_topology_cannot_be_cached(
 
     applied: list[set[int]] = []
     monkeypatch.setattr(cpu_numa, "get_cpu_ids_by_node", unreadable)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(40)))
     monkeypatch.setattr(
         os, "sched_setaffinity", lambda _pid, cpus: applied.append(cpus)
     )
+    monkeypatch.delenv(cpu_numa.LAUNCHER_CPUS_ENV, raising=False)
     monkeypatch.setenv(_BIND, "0-3")
 
     cpu_numa.apply_bound_affinity()
@@ -574,6 +579,7 @@ def test_binding_hook_widens_the_mask_to_the_bound_range(monkeypatch) -> None:
 
     applied: list[set[int]] = []
     calls: list[str] = []
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(40)))
     monkeypatch.setattr(
         os, "sched_setaffinity", lambda _pid, cpus: applied.append(cpus)
     )
