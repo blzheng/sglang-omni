@@ -47,6 +47,7 @@ from sglang_omni.profiler.event_recorder import (
 )
 from sglang_omni.proto import AbortMessage, AdminResultMessage
 from sglang_omni.scheduling.message import StageScheduler
+from sglang_omni.utils.cpu import LAUNCHER_CPUS_ENV
 from sglang_omni.utils.gpu_compat import (
     apply_gpu_compat_env_defaults,
     get_gpu_compat_env_defaults,
@@ -270,29 +271,37 @@ def spawn_affinity(spec: StageWorkerProcessSpec) -> Generator[None, None, None]:
     that thread's mask, so every thread the child creates, including pools
     started while it imports its stages, stays on the planned CPUs.
     """
-    launcher_cpus = os.sched_getaffinity(0)
     planned_cpus = spec.cpu_affinity
-    if current_platform.is_cpu():
-        bound_cpus = current_platform.get_process_cpu_mask(
-            os.environ, stage_gpu_ids(spec.stage_specs)
+    on_cpu = current_platform.is_cpu()
+    if on_cpu:
+        planned_cpus = (
+            current_platform.get_process_cpu_mask(
+                os.environ, stage_gpu_ids(spec.stage_specs)
+            )
+            or planned_cpus
         )
-        if bound_cpus and bound_cpus & launcher_cpus:
-            planned_cpus = bound_cpus & launcher_cpus
-        else:
-            pass
     else:
         pass
-    if planned_cpus is not None:
-        os.sched_setaffinity(0, planned_cpus)
+    launcher_cpus = os.sched_getaffinity(0) if planned_cpus else None
+    target_cpus = None if launcher_cpus is None else launcher_cpus & set(planned_cpus)
+    if not target_cpus:
+        yield
+        return
+    previous_launcher_env = os.environ.get(LAUNCHER_CPUS_ENV)
+    if on_cpu:
+        # The child reads the topology before narrowing itself, but it inherits this narrowed mask.
+        os.environ[LAUNCHER_CPUS_ENV] = ",".join(map(str, sorted(launcher_cpus)))
     else:
         pass
+    os.sched_setaffinity(0, target_cpus)
     try:
         yield
     finally:
-        if planned_cpus is not None:
-            os.sched_setaffinity(0, launcher_cpus)
+        os.sched_setaffinity(0, launcher_cpus)
+        if previous_launcher_env is None:
+            os.environ.pop(LAUNCHER_CPUS_ENV, None)
         else:
-            pass
+            os.environ[LAUNCHER_CPUS_ENV] = previous_launcher_env
 
 
 @contextmanager

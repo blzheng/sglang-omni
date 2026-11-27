@@ -488,6 +488,60 @@ def test_a_workers_gpu_id_selects_its_bind_entry() -> None:
     assert cpu_numa.bound_cpus(env, [5]) is None
 
 
+def test_the_child_caches_the_topology_under_the_launchers_mask(monkeypatch) -> None:
+    import os
+
+    masks: list[set[int]] = []
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {4, 5, 6})
+    monkeypatch.setattr(
+        os, "sched_setaffinity", lambda _pid, cpus: masks.append(set(cpus))
+    )
+    monkeypatch.setattr(
+        cpu_numa, "get_cpu_ids_by_node", lambda: masks.append({-1}) or []
+    )
+    monkeypatch.setenv(_BIND, "4-6")
+    monkeypatch.setenv(cpu_numa.LAUNCHER_CPUS_ENV, "0-39")
+
+    cpu_numa.apply_bound_affinity()
+
+    assert masks == [set(range(40)), {-1}, {4, 5, 6}]
+    assert cpu_numa.LAUNCHER_CPUS_ENV not in os.environ
+
+
+def test_an_unbound_worker_never_reads_the_launcher_affinity(monkeypatch) -> None:
+    import os
+
+    from sglang_omni.pipeline import stage_workers
+
+    def unavailable(_pid):
+        raise AttributeError("no sched_getaffinity on this OS")
+
+    monkeypatch.setattr(
+        stage_workers, "current_platform", SimpleNamespace(is_cpu=lambda: False)
+    )
+    monkeypatch.setattr(os, "sched_getaffinity", unavailable)
+
+    with stage_workers.spawn_affinity(_spawn_spec({})):
+        pass
+
+
+def test_the_child_sees_the_launchers_full_mask_during_spawn(monkeypatch) -> None:
+    import os
+
+    from sglang_omni.pipeline import stage_workers
+
+    monkeypatch.setattr(stage_workers, "current_platform", CPUOmniPlatform())
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(8)))
+    monkeypatch.setattr(os, "sched_setaffinity", lambda _pid, _cpus: None)
+    monkeypatch.setenv(_BIND, "4-6")
+    monkeypatch.delenv(cpu_numa.LAUNCHER_CPUS_ENV, raising=False)
+
+    with stage_workers.spawn_affinity(_spawn_spec({})):
+        assert os.environ[cpu_numa.LAUNCHER_CPUS_ENV] == "0,1,2,3,4,5,6,7"
+
+    assert cpu_numa.LAUNCHER_CPUS_ENV not in os.environ
+
+
 def test_bind_list_covers_every_gpu_id_so_sglang_can_index_it(nodes) -> None:
     """SGLang indexes the list by gpu_id; a one-entry list fails its assertion."""
     platform = CPUOmniPlatform()

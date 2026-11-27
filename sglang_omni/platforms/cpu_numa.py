@@ -13,10 +13,17 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 
 import sglang.srt.distributed.bootstrap as sglang_bootstrap
-from sglang.srt.utils.device import get_physical_cpus_by_numa_or_block
-from sglang.srt.utils.numa_utils import get_cpu_ids_by_node
+from sglang.srt.utils import get_cpu_ids_by_node
 
-from sglang_omni.utils.cpu import parse_cpu_list
+from sglang_omni.utils.cpu import LAUNCHER_CPUS_ENV, parse_cpu_list
+
+try:
+    from sglang.srt.utils import get_physical_cpus_by_numa
+except ImportError:
+    # The pinned release names it differently from newer SGLang.
+    from sglang.srt.utils import (
+        get_physical_cpus_by_numa_or_block as get_physical_cpus_by_numa,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +72,7 @@ def numa_nodes() -> dict[int, str]:
     """CPU lists of the NUMA nodes that have CPUs, keyed by the node id lscpu reports, which need not be contiguous."""
     return {
         node: ",".join(map(str, sorted(cpus)))
-        for node, cpus in sorted(get_physical_cpus_by_numa_or_block().items())
+        for node, cpus in sorted(get_physical_cpus_by_numa().items())
         if cpus
     }
 
@@ -239,13 +246,23 @@ def bound_cpus(
 def apply_bound_affinity(gpu_ids: Iterable[int | None] = ()) -> None:
     """Move the worker onto its bound CPUs before anything creates threads, for workers that never start SGLang's own pinning."""
     cpus = bound_cpus(os.environ, gpu_ids)
+    launcher_cpus = os.environ.pop(LAUNCHER_CPUS_ENV, "")
     if cpus is None:
         return
+    spawned_cpus = os.sched_getaffinity(0)
     try:
-        # SGLang caches the topology intersected with the current affinity, so read it before narrowing.
+        # SGLang caches the topology intersected with the current affinity, so cache it under the launcher's mask, which the spawn narrowed away.
+        if launcher_cpus:
+            os.sched_setaffinity(0, parse_cpu_list(launcher_cpus))
         get_cpu_ids_by_node()
-        os.sched_setaffinity(0, cpus)
     except Exception as exc:
+        logger.warning("Could not cache the NUMA topology (%s).", exc)
+        if launcher_cpus:
+            os.sched_setaffinity(0, spawned_cpus)
+        return
+    try:
+        os.sched_setaffinity(0, cpus)
+    except OSError as exc:
         logger.warning("Could not apply the bound CPU range (%s).", exc)
 
 
