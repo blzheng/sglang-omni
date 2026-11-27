@@ -30,14 +30,18 @@ def nodes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return topology
 
 
-def _stage(name: str, tp_size: int = 1):
+def _stage(name: str, tp_size: int = 1, tp_rank: int = 0):
     return SimpleNamespace(
-        stage_name=name, tp_size=tp_size, gpu_id=0, allow_child_processes=False
+        stage_name=name,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        gpu_id=0,
+        allow_child_processes=False,
     )
 
 
-def _bind(platform, process_name, stage_names, env, tp_size: int = 1):
-    specs = [_stage(n, tp_size) for n in stage_names]
+def _bind(platform, process_name, stage_names, env, tp_size: int = 1, tp_rank: int = 0):
+    specs = [_stage(n, tp_size, tp_rank) for n in stage_names]
     return platform.get_process_placement_env(process_name, specs, env=env)
 
 
@@ -168,14 +172,54 @@ def test_an_operator_supplied_mask_is_never_second_guessed(nodes) -> None:
     assert _bind(platform, "p", ["s"], env={_BIND: "0-3"}) == {}
 
 
-def test_a_tp_group_is_left_to_sglang(nodes) -> None:
-    """A CPU TP group needs one range per rank and all ranks must agree on the
-    split. This per-process hook cannot coordinate that, so it must not emit a
-    mask that contradicts tp_size.
-    """
+def test_each_tp_rank_process_gets_its_own_node(nodes) -> None:
     platform = CPUOmniPlatform()
 
-    assert _bind(platform, "p", ["s"], env={}, tp_size=4) == {}
+    rank0 = _bind(platform, "thinker_tp0", ["thinker"], env={}, tp_size=2, tp_rank=0)
+    rank1 = _bind(platform, "thinker_tp1", ["thinker"], env={}, tp_size=2, tp_rank=1)
+
+    assert rank0 != rank1
+    assert all(_BIND in env for env in (rank0, rank1))
+
+
+def test_a_tp_group_takes_the_least_used_nodes(nodes) -> None:
+    platform = CPUOmniPlatform()
+
+    _bind(platform, "pre", ["pre"], env={})
+    _bind(platform, "img", ["img"], env={})
+    ranks = [
+        _bind(platform, f"thinker_tp{r}", ["thinker"], env={}, tp_size=2, tp_rank=r)[
+            _BIND
+        ]
+        for r in range(2)
+    ]
+
+    assert ranks == [nodes[2], nodes[3]]
+
+
+def test_a_user_map_lists_one_node_per_tp_rank(nodes) -> None:
+    platform = CPUOmniPlatform()
+    env = {_MAP: "thinker=1+3"}
+
+    ranks = [
+        _bind(platform, f"thinker_tp{r}", ["thinker"], env=env, tp_size=2, tp_rank=r)[
+            _BIND
+        ]
+        for r in range(2)
+    ]
+
+    assert ranks == [nodes[1], nodes[3]]
+
+
+def test_a_user_map_with_the_wrong_rank_count_is_rejected(nodes) -> None:
+    with pytest.raises(ValueError, match="tp_size"):
+        _bind(
+            CPUOmniPlatform(),
+            "thinker_tp0",
+            ["thinker"],
+            env={_MAP: "thinker=0+1+2"},
+            tp_size=2,
+        )
 
 
 def test_an_unreadable_topology_degrades_to_the_previous_behaviour(
@@ -281,6 +325,7 @@ def _spawn_spec(env_defaults, written_env=frozenset(), cpu_threads=None):
     stage = SimpleNamespace(
         stage_name="pre",
         tp_size=1,
+        tp_rank=0,
         gpu_id=0,
         allow_child_processes=False,
         env_defaults=env_defaults,
@@ -327,7 +372,7 @@ def test_cpu_plan_fallback_is_capped_to_the_bound_node(monkeypatch) -> None:
 def test_bind_list_covers_every_gpu_id_so_sglang_can_index_it(nodes) -> None:
     """SGLang indexes the list by gpu_id; a one-entry list fails its assertion."""
     platform = CPUOmniPlatform()
-    stage = SimpleNamespace(stage_name="s", tp_size=1, gpu_id=2)
+    stage = SimpleNamespace(stage_name="s", tp_size=1, tp_rank=0, gpu_id=2)
 
     mask = platform.get_process_placement_env("p", [stage], env={})[_BIND]
 
@@ -395,3 +440,35 @@ def test_non_cpu_platforms_never_reach_the_cpu_hooks(monkeypatch) -> None:
     spec = _spawn_spec({"OMP_NUM_THREADS": "192"})
     with stage_workers.patched_spawn_env(spec):
         assert os.environ["OMP_NUM_THREADS"] == "192"
+
+
+def test_node_core_count_is_the_smallest_node(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cpu_numa, "get_cpu_ids_by_node", lambda: ["0-31,128-159", "32-47"]
+    )
+
+    assert cpu_numa.node_core_count() == 16
+
+
+def test_cpu_thread_plan_uses_the_node_budget_not_the_host_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.pipeline import mp_runner
+    from sglang_omni.pipeline.stage_workers import (
+        StageLaunchConfig,
+        StageWorkerProcessSpec,
+    )
+
+    monkeypatch.setattr(mp_runner, "effective_cpu_count", lambda: 384)
+    monkeypatch.setattr(
+        mp_runner,
+        "current_platform",
+        SimpleNamespace(get_process_thread_budget=lambda: 32),
+    )
+    specs = [
+        StageWorkerProcessSpec(f"p{i}", [StageLaunchConfig(f"s{i}")]) for i in range(7)
+    ]
+
+    mp_runner.apply_cpu_thread_plan([SimpleNamespace(process_specs=specs)])
+
+    assert {spec.cpu_threads for spec in specs} == {32}

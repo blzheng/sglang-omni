@@ -47,6 +47,9 @@ class CPUOmniPlatform(CpuDeviceMixin, OmniPlatform):
     def prepare_worker_process(self) -> None:
         cpu_numa.install_binding_hook()
 
+    def get_process_thread_budget(self) -> int | None:
+        return cpu_numa.node_core_count()
+
     def get_process_thread_cap(self, env: Mapping[str, str]) -> int | None:
         return cpu_numa.bound_core_count(env)
 
@@ -62,6 +65,7 @@ class CPUOmniPlatform(CpuDeviceMixin, OmniPlatform):
             process_name=process_name,
             stage_names=[spec.stage_name for spec in stage_specs],
             tp_size=max(spec.tp_size for spec in stage_specs),
+            tp_rank=stage_specs[0].tp_rank,
             gpu_ids=[spec.gpu_id for spec in stage_specs],
             env=env,
         )

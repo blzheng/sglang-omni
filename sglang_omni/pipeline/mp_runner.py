@@ -48,6 +48,7 @@ from sglang_omni.pipeline.stage_workers import (
     stage_gpu_ids,
 )
 from sglang_omni.pipeline.weight_share import WeightSharePlan, plan_weight_share
+from sglang_omni.platforms import current_platform
 from sglang_omni.utils.cpu import effective_cpu_count, gpu_local_affinity
 from sglang_omni.utils.imports import import_string
 from sglang_omni.utils.port_claim import NCCL_PORT_BASE, NCCL_PORT_SPAN, claim_tcp_port
@@ -335,7 +336,9 @@ def apply_cpu_thread_plan(groups: list[StageGroup]) -> dict[str, int]:
 
     cpu_budget = effective_cpu_count()
     process_count = len(process_specs)
-    threads_per_process = max(1, cpu_budget // process_count)
+    threads_per_process = current_platform.get_process_thread_budget() or max(
+        1, cpu_budget // process_count
+    )
     plan = {}
     # note (Richard Wang): CPU-only processes stay near the GPUs the pipeline
     # uses, not every visible one, and are left alone when it uses none.

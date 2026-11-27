@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from collections import Counter
 from collections.abc import Iterable, Mapping
 
 import sglang.srt.distributed.bootstrap as sglang_bootstrap
@@ -23,6 +24,8 @@ NUMA_MAP_ENV = "SGLANG_OMNI_CPU_NUMA_MAP"
 WIDEN_HOOK_MARKER = "omni_widen_hooked"
 
 node_by_process_name: dict[str, int] = {}
+node_usage: Counter[int] = Counter()
+tp_group_nodes: dict[str, list[int]] = {}
 node_assignment_lock = threading.Lock()
 
 
@@ -30,9 +33,9 @@ class NumaPlacementConflict(ValueError):
     """Two stages in one process were asked for different NUMA nodes."""
 
 
-def parse_numa_map(raw: str | None) -> dict[str, int]:
-    """Parse "thinker=0,talker=1" into {"thinker": 0, "talker": 1}."""
-    mapping: dict[str, int] = {}
+def parse_numa_map(raw: str | None) -> dict[str, tuple[int, ...]]:
+    """Parse "thinker=0+1,talker=2" into {"thinker": (0, 1), "talker": (2,)}, one node per tp rank."""
+    mapping: dict[str, tuple[int, ...]] = {}
     for item in (raw or "").split(","):
         item = item.strip()
         if not item:
@@ -41,19 +44,19 @@ def parse_numa_map(raw: str | None) -> dict[str, int]:
         name, value = name.strip(), value.strip()
         if not separator or not name or not value:
             raise ValueError(
-                f"{NUMA_MAP_ENV} entries must look like '<stage>=<node>', got {item!r}"
+                f"{NUMA_MAP_ENV} entries must look like '<stage>=<node>' or '<stage>=<node>+<node>', got {item!r}"
             )
         try:
-            node = int(value)
+            nodes = tuple(int(part) for part in value.split("+"))
         except ValueError as exc:
             raise ValueError(
-                f"{NUMA_MAP_ENV} node for stage {name!r} must be an integer, got {value!r}"
+                f"{NUMA_MAP_ENV} nodes for stage {name!r} must be integers joined by '+', got {value!r}"
             ) from exc
-        if node < 0:
+        if min(nodes) < 0:
             raise ValueError(
-                f"{NUMA_MAP_ENV} node for stage {name!r} must be >= 0, got {node}"
+                f"{NUMA_MAP_ENV} nodes for stage {name!r} must be >= 0, got {value!r}"
             )
-        mapping[name] = node
+        mapping[name] = nodes
     return mapping
 
 
@@ -89,32 +92,83 @@ def reset_assignment() -> None:
     """Forget recorded placements, for tests and for a changed topology or map."""
     with node_assignment_lock:
         node_by_process_name.clear()
+        node_usage.clear()
+        tp_group_nodes.clear()
+
+
+def assign_node(
+    process_name: str,
+    stage_names: list[str],
+    tp_size: int,
+    tp_rank: int,
+    user_map: Mapping[str, tuple[int, ...]],
+    cpu_ids_per_node: list[str],
+) -> int:
+    """Pick and record the node of one process; the caller holds node_assignment_lock."""
+    node_count = len(cpu_ids_per_node)
+    group = ",".join(stage_names)
+    requested: dict[str, int] = {}
+    for name in stage_names:
+        nodes = user_map.get(name)
+        if nodes is None:
+            continue
+        if len(nodes) not in (1, tp_size):
+            raise ValueError(
+                f"{NUMA_MAP_ENV} lists {len(nodes)} nodes for stage {name!r}, which has tp_size {tp_size}."
+            )
+        requested[name] = nodes[tp_rank] if len(nodes) > 1 else nodes[0]
+
+    if not requested and tp_size > 1:
+        planned = tp_group_nodes.get(group)
+        if planned is None:
+            by_load = sorted(range(node_count), key=lambda n: (node_usage[n], n))
+            planned = sorted(by_load[rank % node_count] for rank in range(tp_size))
+            tp_group_nodes[group] = planned
+            if any(node_usage[node] for node in planned):
+                logger.warning(
+                    "Tensor-parallel ranks of %s share NUMA nodes with other worker processes; spread them with %s.",
+                    group,
+                    NUMA_MAP_ENV,
+                )
+            node_usage.update(planned)
+        node = planned[tp_rank]
+    else:
+        auto_index = min(range(node_count), key=lambda n: (node_usage[n], n))
+        node = resolve_process_node(
+            stage_names,
+            node_count=node_count,
+            user_map=requested,
+            auto_index=auto_index,
+        )
+        if node_usage[node]:
+            logger.warning(
+                "Process %s shares NUMA node %d with another worker process; "
+                "their OMP threads are pinned to the same cores. Spread them with %s.",
+                process_name,
+                node,
+                NUMA_MAP_ENV,
+            )
+        node_usage[node] += 1
+    node_by_process_name[process_name] = node
+    return node
 
 
 def threads_bind_env(
     *,
     process_name: str,
     stage_names: list[str],
-    tp_size: int,
+    tp_size: int = 1,
+    tp_rank: int = 0,
     gpu_ids: Iterable[int | None] = (),
     env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Return the SGLANG_CPU_OMP_THREADS_BIND override for one process.
 
-    SGLang indexes the bind list by gpu_id, so the list repeats the node once per index up to the largest gpu_id.
+    SGLang indexes the bind list by gpu_id, so the list repeats the node once per index up to the largest gpu_id. Each tp rank is its own process and gets its own node, since every rank carries gpu_id 0 on CPU.
     """
     source_env = env if env is not None else os.environ
     if source_env.get(THREADS_BIND_ENV):
         return {}
-    if tp_size > 1:
-        logger.warning(
-            "Process %s has tp_size=%d; skipping NUMA placement and leaving "
-            "SGLang's per-rank default.",
-            process_name,
-            tp_size,
-        )
-        return {}
-
     try:
         cpu_ids_per_node = get_cpu_ids_by_node()
     except Exception as exc:
@@ -131,21 +185,14 @@ def threads_bind_env(
     with node_assignment_lock:
         node = node_by_process_name.get(process_name)
         if node is None:
-            node = resolve_process_node(
+            node = assign_node(
+                process_name,
                 stage_names,
-                node_count=len(cpu_ids_per_node),
-                user_map=user_map,
-                auto_index=len(node_by_process_name),
+                tp_size,
+                tp_rank,
+                user_map,
+                cpu_ids_per_node,
             )
-            if node in node_by_process_name.values():
-                logger.warning(
-                    "Process %s shares NUMA node %d with another worker process; "
-                    "their OMP threads are pinned to the same cores. Spread them with %s.",
-                    process_name,
-                    node,
-                    NUMA_MAP_ENV,
-                )
-            node_by_process_name[process_name] = node
     logger.info(
         "Binding CPU process %s (stages: %s) to NUMA node %d of %d.",
         process_name,
@@ -170,6 +217,16 @@ def bound_core_count(env: Mapping[str, str]) -> int | None:
     try:
         return len(parse_cpu_list(raw.split("|", 1)[0])) or None
     except ValueError:
+        return None
+
+
+def node_core_count() -> int | None:
+    """Cores of the smallest NUMA node, the most one bound process or one tp rank runs OMP threads on."""
+    try:
+        cpu_ids_per_node = get_cpu_ids_by_node()
+        return min(len(parse_cpu_list(ids)) for ids in cpu_ids_per_node) or None
+    except Exception as exc:
+        logger.warning("Could not read the NUMA topology (%s).", exc)
         return None
 
 
