@@ -331,22 +331,6 @@ def patched_spawn_env(
                 env_default_updates[key] = value
             else:
                 pass
-    default_threads = env_default_updates.get("OMP_NUM_THREADS", "")
-    if (
-        spec.cpu_affinity is not None
-        and default_threads.isdigit()
-        and int(default_threads) > len(spec.cpu_affinity)
-        and not any(
-            "OMP_NUM_THREADS" in stage_spec.written_env
-            for stage_spec in spec.stage_specs
-        )
-    ):
-        # note (Richard Wang): a derived default sized for the whole host would
-        # put more threads than CPUs on a bound process. Written values still win.
-        env_default_updates["OMP_NUM_THREADS"] = str(len(spec.cpu_affinity))
-    else:
-        pass
-
     worker_process_env = get_worker_process_env(
         spec, {**os.environ, **env_default_updates}
     )
@@ -365,7 +349,8 @@ def patched_spawn_env(
         if current_platform.is_cpu()
         else None
     )
-    thread_cap = len(bound_cpus) if bound_cpus else None
+    caps = [len(cpus) for cpus in (spec.cpu_affinity, bound_cpus) if cpus]
+    thread_cap = min(caps) if caps else None
     planned_threads = env_default_updates.get("OMP_NUM_THREADS", "")
     if (
         thread_cap is not None
@@ -376,8 +361,8 @@ def patched_spawn_env(
             for stage_spec in spec.stage_specs
         )
     ):
-        # The platform binds this process to fewer cores than a default sized
-        # for the host; written values still win.
+        # note (Richard Wang): a derived default sized for the whole host would
+        # put more threads than CPUs on a bound process. Written values still win.
         env_default_updates["OMP_NUM_THREADS"] = str(thread_cap)
     updates = {
         **env_default_updates,
@@ -394,7 +379,7 @@ def patched_spawn_env(
         updates["OMP_NUM_THREADS"] = str(
             spec.cpu_threads
             if thread_cap is None
-            else max(1, min(spec.cpu_threads, thread_cap))
+            else min(spec.cpu_threads, thread_cap)
         )
         updates["SGLANG_OMNI_OMP_FROM_CPU_PLAN"] = "1"
         omp_source = "cpu_plan_fallback"
