@@ -45,6 +45,7 @@ class CPUOmniPlatform(CpuDeviceMixin, OmniPlatform):
         return effective_quantization
 
     def prepare_worker_process(self) -> None:
+        cpu_numa.apply_bound_affinity()
         cpu_numa.install_binding_hook()
 
     def get_process_thread_budget(self) -> int | None:

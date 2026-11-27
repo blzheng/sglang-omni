@@ -129,6 +129,18 @@ def test_unnamed_processes_still_spread_around_a_user_entry(nodes) -> None:
     assert auto != pinned
 
 
+def test_auto_placement_keeps_off_nodes_the_map_reserves(nodes) -> None:
+    """A stage placed later on its mapped node must not find an auto worker there."""
+    platform = CPUOmniPlatform()
+    env = {_MAP: "talker=1"}
+
+    auto = [_bind(platform, f"p{i}", [f"s{i}"], env=env)[_BIND] for i in range(3)]
+    talker = _bind(platform, "talker", ["talker"], env=env)[_BIND]
+
+    assert nodes[1] not in auto
+    assert talker == nodes[1]
+
+
 def test_splitting_one_process_across_nodes_is_refused(nodes) -> None:
     """The mask binds the process, so honouring both entries is impossible.
     Saying so beats silently binding to whichever stage came first.
@@ -367,6 +379,38 @@ def test_cpu_plan_fallback_is_capped_to_the_bound_node(monkeypatch) -> None:
     spec = _spawn_spec({}, cpu_threads=48)
 
     assert _spawned_omp_threads(monkeypatch, spec) == "10"
+
+
+def test_node_cap_never_raises_an_affinity_capped_default(monkeypatch) -> None:
+    spec = _spawn_spec({"OMP_NUM_THREADS": "192"})
+    spec.cpu_affinity = frozenset(range(4))
+
+    assert _spawned_omp_threads(monkeypatch, spec) == "4"
+
+
+def test_a_bind_list_configured_on_the_stage_is_not_overwritten(
+    monkeypatch, nodes
+) -> None:
+    from sglang_omni.pipeline import stage_workers
+
+    monkeypatch.setattr(stage_workers, "current_platform", CPUOmniPlatform())
+    spec = _spawn_spec({})
+
+    assert stage_workers.get_worker_process_env(spec, {_BIND: "0-3"}) == {}
+
+
+def test_a_worker_without_sglang_is_still_moved_onto_its_node(monkeypatch) -> None:
+    import os
+
+    applied: list[set[int]] = []
+    monkeypatch.setattr(
+        os, "sched_setaffinity", lambda _pid, cpus: applied.append(set(cpus))
+    )
+    monkeypatch.setenv(_BIND, "4-6|10-12")
+
+    cpu_numa.apply_bound_affinity()
+
+    assert applied == [{4, 5, 6}]
 
 
 def test_bind_list_covers_every_gpu_id_so_sglang_can_index_it(nodes) -> None:

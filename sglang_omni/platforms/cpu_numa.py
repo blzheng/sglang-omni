@@ -107,6 +107,11 @@ def assign_node(
     """Pick and record the node of one process; the caller holds node_assignment_lock."""
     node_count = len(cpu_ids_per_node)
     group = ",".join(stage_names)
+    reserved = {node for nodes in user_map.values() for node in nodes}
+    free_nodes = [n for n in range(node_count) if n not in reserved] or list(
+        range(node_count)
+    )
+    by_load = sorted(free_nodes, key=lambda n: (node_usage[n], n))
     requested: dict[str, int] = {}
     for name in stage_names:
         nodes = user_map.get(name)
@@ -121,8 +126,7 @@ def assign_node(
     if not requested and tp_size > 1:
         planned = tp_group_nodes.get(group)
         if planned is None:
-            by_load = sorted(range(node_count), key=lambda n: (node_usage[n], n))
-            planned = sorted(by_load[rank % node_count] for rank in range(tp_size))
+            planned = sorted(by_load[rank % len(by_load)] for rank in range(tp_size))
             tp_group_nodes[group] = planned
             if any(node_usage[node] for node in planned):
                 logger.warning(
@@ -133,12 +137,11 @@ def assign_node(
             node_usage.update(planned)
         node = planned[tp_rank]
     else:
-        auto_index = min(range(node_count), key=lambda n: (node_usage[n], n))
         node = resolve_process_node(
             stage_names,
             node_count=node_count,
             user_map=requested,
-            auto_index=auto_index,
+            auto_index=by_load[0],
         )
         if node_usage[node]:
             logger.warning(
@@ -204,6 +207,17 @@ def threads_bind_env(
         max((gpu_id for gpu_id in gpu_ids if gpu_id is not None), default=0) + 1
     )
     return {THREADS_BIND_ENV: "|".join([cpu_ids_per_node[node]] * entry_count)}
+
+
+def apply_bound_affinity() -> None:
+    """Move the worker onto its bound node before anything creates threads, for workers that never start SGLang's own pinning."""
+    raw = os.environ.get(THREADS_BIND_ENV, "").strip()
+    if not raw or raw == "all":
+        return
+    try:
+        os.sched_setaffinity(0, parse_cpu_list(raw.split("|", 1)[0]))
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not apply the bound CPU range %r (%s).", raw, exc)
 
 
 def bound_core_count(env: Mapping[str, str]) -> int | None:

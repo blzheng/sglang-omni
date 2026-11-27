@@ -203,7 +203,9 @@ class StageWorkerProcessSpec:
     failure_event: Event | None = field(default=None, repr=False, compare=False)
 
 
-def get_worker_process_env(spec: StageWorkerProcessSpec) -> dict[str, str]:
+def get_worker_process_env(
+    spec: StageWorkerProcessSpec, env: Mapping[str, str] | None = None
+) -> dict[str, str]:
     """Return the spawn-time env overrides for *spec*.
 
     Hard invariant: a TP stage (``tp_size > 1``) must own its OS process
@@ -247,7 +249,7 @@ def get_worker_process_env(spec: StageWorkerProcessSpec) -> dict[str, str]:
     else:
         pass
     placement_env = current_platform.get_process_placement_env(
-        spec.process_name, list(spec.stage_specs)
+        spec.process_name, list(spec.stage_specs), env=env
     )
     return {**stage_env, **placement_env}
 
@@ -317,7 +319,9 @@ def patched_spawn_env(
     else:
         pass
 
-    worker_process_env = get_worker_process_env(spec)
+    worker_process_env = get_worker_process_env(
+        spec, {**os.environ, **env_default_updates}
+    )
     compat_env_defaults = get_gpu_compat_env_defaults(
         {
             **os.environ,
@@ -332,10 +336,11 @@ def patched_spawn_env(
         if current_platform.is_cpu()
         else None
     )
+    planned_threads = env_default_updates.get("OMP_NUM_THREADS", "")
     if (
         thread_cap is not None
-        and default_threads.isdigit()
-        and int(default_threads) > thread_cap
+        and planned_threads.isdigit()
+        and int(planned_threads) > thread_cap
         and not any(
             "OMP_NUM_THREADS" in stage_spec.written_env
             for stage_spec in spec.stage_specs
