@@ -542,6 +542,23 @@ def test_the_child_sees_the_launchers_full_mask_during_spawn(monkeypatch) -> Non
     assert cpu_numa.LAUNCHER_CPUS_ENV not in os.environ
 
 
+def test_bound_affinity_never_leaves_the_launchers_allocation(monkeypatch) -> None:
+    import os
+
+    applied: list[set[int]] = []
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {4, 5, 6, 7})
+    monkeypatch.setattr(
+        os, "sched_setaffinity", lambda _pid, cpus: applied.append(set(cpus))
+    )
+    monkeypatch.setattr(cpu_numa, "get_cpu_ids_by_node", lambda: [])
+    monkeypatch.setenv(_BIND, "6-9")
+    monkeypatch.setenv(cpu_numa.LAUNCHER_CPUS_ENV, "4-7")
+
+    cpu_numa.apply_bound_affinity()
+
+    assert applied[-1] == {6, 7}
+
+
 def test_bind_list_covers_every_gpu_id_so_sglang_can_index_it(nodes) -> None:
     """SGLang indexes the list by gpu_id; a one-entry list fails its assertion."""
     platform = CPUOmniPlatform()
@@ -636,7 +653,7 @@ def test_cpu_thread_plan_uses_the_node_budget_not_the_host_share(
         "current_platform",
         SimpleNamespace(
             get_process_thread_budget=lambda: 32,
-            reset_process_placement=lambda: None,
+            plan_process_placement=lambda _specs: None,
         ),
     )
     specs = [
@@ -652,9 +669,22 @@ def test_planning_a_pipeline_forgets_earlier_placements(nodes) -> None:
     platform = CPUOmniPlatform()
     assert _bind(platform, "old", ["old"], {})[_BIND] == nodes[0]
 
-    platform.reset_process_placement()
+    platform.plan_process_placement([])
 
     assert _bind(platform, "new", ["new"], {})[_BIND] == nodes[0]
+
+
+def test_planning_reserves_nodes_a_later_worker_pins_explicitly(
+    monkeypatch, nodes
+) -> None:
+    platform = CPUOmniPlatform()
+    monkeypatch.delenv(_BIND, raising=False)
+    pinned = _spawn_spec({_BIND: "0-9"})
+    pinned.process_name = "pinned"
+
+    platform.plan_process_placement([_spawn_spec({}), pinned])
+
+    assert _bind(platform, "auto", ["a"], {})[_BIND] == nodes[1]
 
 
 def test_thread_plan_node_budget_respects_the_cpu_quota(monkeypatch) -> None:
@@ -670,7 +700,7 @@ def test_thread_plan_node_budget_respects_the_cpu_quota(monkeypatch) -> None:
         "current_platform",
         SimpleNamespace(
             get_process_thread_budget=lambda: 64,
-            reset_process_placement=lambda: None,
+            plan_process_placement=lambda _specs: None,
         ),
     )
     specs = [

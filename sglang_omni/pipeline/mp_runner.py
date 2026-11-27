@@ -334,7 +334,7 @@ def apply_cpu_thread_plan(groups: list[StageGroup]) -> dict[str, int]:
     else:
         pass
 
-    current_platform.reset_process_placement()
+    current_platform.plan_process_placement(process_specs)
     cpu_budget = effective_cpu_count()
     process_count = len(process_specs)
     host_share = max(1, cpu_budget // process_count)

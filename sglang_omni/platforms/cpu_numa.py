@@ -153,13 +153,17 @@ def assign_node(
 
 
 def claim_explicit_nodes(
-    process_name: str,
-    env: Mapping[str, str],
-    gpu_ids: Iterable[int | None],
-    topology: Mapping[int, str],
+    process_name: str, env: Mapping[str, str], gpu_ids: Iterable[int | None]
 ) -> None:
     """Count the nodes a user-set bind list covers, so auto placement does not stack other workers on them."""
-    claimed = bound_cpus(env, gpu_ids) or set()
+    claimed = bound_cpus(env, gpu_ids)
+    if not claimed:
+        return
+    try:
+        topology = numa_nodes()
+    except Exception as exc:
+        logger.warning("Could not read the NUMA topology (%s).", exc)
+        return
     covered = [node for node, ids in topology.items() if parse_cpu_list(ids) & claimed]
     with node_assignment_lock:
         if covered and process_name not in node_by_process_name:
@@ -193,7 +197,7 @@ def threads_bind_env(
     if not topology:
         return {}
     if source_env.get(THREADS_BIND_ENV):
-        claim_explicit_nodes(process_name, source_env, gpu_ids, topology)
+        claim_explicit_nodes(process_name, source_env, gpu_ids)
         return {}
 
     user_map = parse_numa_map(source_env.get(NUMA_MAP_ENV))
@@ -250,20 +254,25 @@ def apply_bound_affinity(gpu_ids: Iterable[int | None] = ()) -> None:
     if cpus is None:
         return
     spawned_cpus = os.sched_getaffinity(0)
+    allowed_cpus = parse_cpu_list(launcher_cpus) if launcher_cpus else spawned_cpus
     try:
         # SGLang caches the topology intersected with the current affinity, so cache it under the launcher's mask, which the spawn narrowed away.
         if launcher_cpus:
-            os.sched_setaffinity(0, parse_cpu_list(launcher_cpus))
+            os.sched_setaffinity(0, allowed_cpus)
         get_cpu_ids_by_node()
     except Exception as exc:
         logger.warning("Could not cache the NUMA topology (%s).", exc)
         if launcher_cpus:
             os.sched_setaffinity(0, spawned_cpus)
         return
+    target_cpus = cpus & allowed_cpus
     try:
-        os.sched_setaffinity(0, cpus)
+        if not target_cpus:
+            raise OSError("the bound CPUs are outside the launcher's allowed CPUs")
+        os.sched_setaffinity(0, target_cpus)
     except OSError as exc:
         logger.warning("Could not apply the bound CPU range (%s).", exc)
+        os.sched_setaffinity(0, spawned_cpus)
 
 
 def node_core_count() -> int | None:
@@ -292,6 +301,7 @@ def install_binding_hook() -> bool:
     def widen_after_binding(
         *, local_omp_cpuid: str | list[int] | None, **kwargs
     ) -> None:
+        allowed_cpus = os.sched_getaffinity(0)
         original(local_omp_cpuid=local_omp_cpuid, **kwargs)
         if not local_omp_cpuid:
             return
@@ -299,7 +309,9 @@ def install_binding_hook() -> bool:
             parse_cpu_list(local_omp_cpuid)
             if isinstance(local_omp_cpuid, str)
             else set(local_omp_cpuid)
-        )
+        ) & allowed_cpus
+        if not cpus:
+            return
         try:
             os.sched_setaffinity(0, cpus)
         except OSError as exc:

@@ -18,7 +18,10 @@ if TYPE_CHECKING:
     from torch.nn.attention import SDPBackend
 
     from sglang_omni.comm.data_ref import TransportKind
-    from sglang_omni.pipeline.stage_workers import StageLaunchConfig
+    from sglang_omni.pipeline.stage_workers import (
+        StageLaunchConfig,
+        StageWorkerProcessSpec,
+    )
     from sglang_omni.platforms.device_graph import DeviceGraphBackend
     from sglang_omni.profiler.torch_profiler import TorchProfiler
 else:
@@ -151,8 +154,10 @@ class OmniPlatform(DeviceMixin):
         """Return env that places a whole worker process, for platforms that cannot place a stage by device index."""
         return {}
 
-    def reset_process_placement(self) -> None:
-        """Forget placements recorded for earlier worker processes, before a pipeline plans its own."""
+    def plan_process_placement(
+        self, process_specs: list[StageWorkerProcessSpec]
+    ) -> None:
+        """Forget placements of earlier pipelines and reserve what this pipeline's workers already pin, before any worker starts."""
 
     def get_process_cpu_mask(
         self, env: Mapping[str, str], gpu_ids: Iterable[int | None] = ()

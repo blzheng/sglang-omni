@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
 
@@ -15,7 +16,10 @@ from sglang_omni.platforms import cpu_numa
 from sglang_omni.platforms.interface import OmniPlatform
 
 if TYPE_CHECKING:
-    from sglang_omni.pipeline.stage_workers import StageLaunchConfig
+    from sglang_omni.pipeline.stage_workers import (
+        StageLaunchConfig,
+        StageWorkerProcessSpec,
+    )
 
 
 class CPUOmniPlatform(CpuDeviceMixin, OmniPlatform):
@@ -48,8 +52,19 @@ class CPUOmniPlatform(CpuDeviceMixin, OmniPlatform):
         cpu_numa.apply_bound_affinity(gpu_ids)
         cpu_numa.install_binding_hook()
 
-    def reset_process_placement(self) -> None:
+    def plan_process_placement(
+        self, process_specs: list[StageWorkerProcessSpec]
+    ) -> None:
         cpu_numa.reset_assignment()
+        for spec in process_specs:
+            env = {}
+            for stage_spec in spec.stage_specs:
+                env.update(stage_spec.env_defaults)
+            cpu_numa.claim_explicit_nodes(
+                spec.process_name,
+                {**env, **os.environ},
+                [stage_spec.gpu_id for stage_spec in spec.stage_specs],
+            )
 
     def get_process_thread_budget(self) -> int | None:
         return cpu_numa.node_core_count()
