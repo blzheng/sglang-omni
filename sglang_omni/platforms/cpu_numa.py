@@ -77,6 +77,15 @@ def numa_nodes() -> dict[int, str]:
     }
 
 
+def read_numa_nodes(consequence: str) -> dict[int, str] | None:
+    """The NUMA topology, or None with a warning naming what is skipped when lscpu cannot be read."""
+    try:
+        return numa_nodes()
+    except (RuntimeError, OSError) as exc:
+        logger.warning("Could not read the NUMA topology (%s); %s.", exc, consequence)
+        return None
+
+
 def reset_assignment() -> None:
     """Forget recorded placements, for tests and for a changed topology or map."""
     with node_assignment_lock:
@@ -159,10 +168,8 @@ def claim_explicit_nodes(
     claimed = bound_cpus(env, gpu_ids)
     if not claimed:
         return
-    try:
-        topology = numa_nodes()
-    except Exception as exc:
-        logger.warning("Could not read the NUMA topology (%s).", exc)
+    topology = read_numa_nodes("explicit binds are not counted")
+    if topology is None:
         return
     covered = [node for node, ids in topology.items() if parse_cpu_list(ids) & claimed]
     with node_assignment_lock:
@@ -185,15 +192,7 @@ def threads_bind_env(
     SGLang indexes the bind list by gpu_id, so the list repeats the node once per index up to the largest gpu_id. Each tp rank is its own process and gets its own node, since every rank carries gpu_id 0 on CPU.
     """
     source_env = env if env is not None else os.environ
-    try:
-        topology = numa_nodes()
-    except Exception as exc:
-        logger.warning(
-            "Could not read the NUMA topology (%s); leaving %s unset.",
-            exc,
-            THREADS_BIND_ENV,
-        )
-        return {}
+    topology = read_numa_nodes(f"leaving {THREADS_BIND_ENV} unset")
     if not topology:
         return {}
     if source_env.get(THREADS_BIND_ENV):
@@ -260,7 +259,7 @@ def apply_bound_affinity(gpu_ids: Iterable[int | None] = ()) -> None:
         if launcher_cpus:
             os.sched_setaffinity(0, allowed_cpus)
         get_cpu_ids_by_node()
-    except Exception as exc:
+    except (RuntimeError, OSError) as exc:
         logger.warning("Could not cache the NUMA topology (%s).", exc)
         if launcher_cpus:
             os.sched_setaffinity(0, spawned_cpus)
@@ -277,11 +276,10 @@ def apply_bound_affinity(gpu_ids: Iterable[int | None] = ()) -> None:
 
 def node_core_count() -> int | None:
     """Cores of the smallest NUMA node, the most one bound process or one tp rank runs OMP threads on."""
-    try:
-        return min(len(parse_cpu_list(ids)) for ids in numa_nodes().values()) or None
-    except Exception as exc:
-        logger.warning("Could not read the NUMA topology (%s).", exc)
+    topology = read_numa_nodes("no per-node thread limit")
+    if not topology:
         return None
+    return min(len(parse_cpu_list(ids)) for ids in topology.values()) or None
 
 
 def install_binding_hook() -> bool:
