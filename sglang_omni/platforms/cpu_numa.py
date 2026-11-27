@@ -60,34 +60,6 @@ def parse_numa_map(raw: str | None) -> dict[str, tuple[int, ...]]:
     return mapping
 
 
-def resolve_process_node(
-    stage_names: list[str],
-    *,
-    node_count: int,
-    user_map: Mapping[str, int],
-    auto_index: int,
-) -> int:
-    """Pick the node for one process: a user entry decides, else spread round-robin."""
-    requested = {name: user_map[name] for name in stage_names if name in user_map}
-    for name, node in requested.items():
-        if node >= node_count:
-            raise ValueError(
-                f"{NUMA_MAP_ENV} asks for node {node} for stage {name!r}, but "
-                f"this host has only {node_count} NUMA node(s)."
-            )
-    if not requested:
-        return auto_index % node_count
-    if len(set(requested.values())) > 1:
-        raise NumaPlacementConflict(
-            f"{NUMA_MAP_ENV} asks to split one process across NUMA nodes: "
-            + ", ".join(
-                f"{name}->node {node}" for name, node in sorted(requested.items())
-            )
-            + ". Stages sharing a process share its binding."
-        )
-    return next(iter(requested.values()))
-
-
 def reset_assignment() -> None:
     """Forget recorded placements, for tests and for a changed topology or map."""
     with node_assignment_lock:
@@ -137,12 +109,21 @@ def assign_node(
             node_usage.update(planned)
         node = planned[tp_rank]
     else:
-        node = resolve_process_node(
-            stage_names,
-            node_count=node_count,
-            user_map=requested,
-            auto_index=by_load[0],
-        )
+        for name, requested_node in requested.items():
+            if requested_node >= node_count:
+                raise ValueError(
+                    f"{NUMA_MAP_ENV} asks for node {requested_node} for stage {name!r}, but "
+                    f"this host has only {node_count} NUMA node(s)."
+                )
+        if len(set(requested.values())) > 1:
+            raise NumaPlacementConflict(
+                f"{NUMA_MAP_ENV} asks to split one process across NUMA nodes: "
+                + ", ".join(
+                    f"{name}->node {node}" for name, node in sorted(requested.items())
+                )
+                + ". Stages sharing a process share its binding."
+            )
+        node = next(iter(requested.values())) if requested else by_load[0]
         if node_usage[node]:
             logger.warning(
                 "Process %s shares NUMA node %d with another worker process; "
